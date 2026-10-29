@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netmon"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -44,6 +46,19 @@ func TestStreamDialEveryConnect(t *testing.T) {
 		t.Cleanup(func() { c.Close() })
 		return c
 	}
+	t.Run("empty_region", func(t *testing.T) {
+		c := derphttp.NewRegionClient(key.NewNode(), t.Logf, netmon.NewStatic(), func() *tailcfg.DERPRegion {
+			return &tailcfg.DERPRegion{RegionID: 7, RegionCode: "signal"}
+		})
+		defer c.Close()
+		c.StreamDial = func(context.Context, string) (net.Conn, error) {
+			t.Fatal("empty region reaches StreamDial")
+			return nil, errors.New("unexpected stream dial")
+		}
+		if err := c.Connect(t.Context()); err == nil || !strings.Contains(err.Error(), "no nodes for region 7 (signal)") {
+			t.Fatalf("empty region error = %v, want no nodes for region 7 (signal)", err)
+		}
+	})
 	awaitClosed := func(t *testing.T, c *closeTrackedStream) {
 		t.Helper()
 		select {

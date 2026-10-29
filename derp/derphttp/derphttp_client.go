@@ -409,6 +409,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		if c.url != nil {
 			urlStr = c.url.String()
 		} else {
+			if len(reg.Nodes) == 0 {
+				return nil, 0, fmt.Errorf("no nodes for %s", c.targetString(reg))
+			}
 			urlStr = c.urlString(reg.Nodes[0])
 		}
 		dial := dialWebsocketFunc
