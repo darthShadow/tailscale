@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
@@ -158,6 +159,7 @@ type metrics struct {
 type Conn struct {
 	relayedDataAllowed      func(peer key.NodePublic) bool
 	derpDataSuppressed      atomic.Int64
+	quicDontFragment        func(string, string, syscall.RawConn) error
 
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
@@ -455,6 +457,11 @@ type Options struct {
 	// independently. The callback must be safe for concurrent calls.
 	RelayedDataAllowed func(peer key.NodePublic) bool
 
+	// QUICDontFragment sets DF before each UDP socket is exposed, including
+	// rebinds. It must return an error if fragmentation cannot be disabled.
+	// A nil callback preserves upstream socket creation.
+	QUICDontFragment func(network, address string, raw syscall.RawConn) error
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -647,6 +654,7 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c := newConn(opts.logf())
 	c.relayedDataAllowed = opts.RelayedDataAllowed
+	c.quicDontFragment = opts.QUICDontFragment
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}
@@ -3756,9 +3764,24 @@ func (c *Conn) listenPacket(network string, port uint16) (nettype.PacketConn, er
 	}
 	addr := net.JoinHostPort("", fmt.Sprint(port))
 	if c.testOnlyPacketListener != nil {
+		if c.quicDontFragment != nil {
+			return nil, errors.New("QUIC DF control requires the UDP listener")
+		}
 		return nettype.MakePacketListenerWithNetIP(c.testOnlyPacketListener).ListenPacket(ctx, network, addr)
 	}
-	return nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.netMon)).ListenPacket(ctx, network, addr)
+	listener := netns.Listener(c.logf, c.netMon)
+	if c.quicDontFragment != nil {
+		previous := listener.Control
+		listener.Control = func(network, address string, raw syscall.RawConn) error {
+			if previous != nil {
+				if err := previous(network, address, raw); err != nil {
+					return err
+				}
+			}
+			return c.quicDontFragment(network, address, raw)
+		}
+	}
+	return nettype.MakePacketListenerWithNetIP(listener).ListenPacket(ctx, network, addr)
 }
 
 // bindSocket binds a UDP socket to ruc.
