@@ -161,6 +161,7 @@ type Conn struct {
 	derpDataSuppressed      atomic.Int64
 	quicDontFragment        func(string, string, syscall.RawConn) error
 	signalingRegions        map[int]SignalingRegion
+	maxCallMeMaybeEndpoints int
 
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
@@ -468,6 +469,10 @@ type Options struct {
 	// Configure the map before NewConn and do not mutate it afterward.
 	SignalingRegions map[int]SignalingRegion
 
+	// MaxCallMeMaybeEndpoints caps advertised endpoints when positive.
+	// Zero preserves upstream's uncapped endpoint order.
+	MaxCallMeMaybeEndpoints int
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -662,6 +667,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.relayedDataAllowed = opts.RelayedDataAllowed
 	c.quicDontFragment = opts.QUICDontFragment
 	c.signalingRegions = opts.SignalingRegions
+	c.maxCallMeMaybeEndpoints = opts.MaxCallMeMaybeEndpoints
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}
@@ -2726,8 +2732,12 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 		return
 	}
 
-	eps := make([]netip.AddrPort, 0, len(c.lastEndpoints))
-	for _, ep := range c.lastEndpoints {
+	endpoints := c.lastEndpoints
+	if c.maxCallMeMaybeEndpoints > 0 {
+		endpoints = CapEndpoints(endpoints, c.maxCallMeMaybeEndpoints)
+	}
+	eps := make([]netip.AddrPort, 0, len(endpoints))
+	for _, ep := range endpoints {
 		eps = append(eps, ep.Addr)
 	}
 	go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, de.publicKey, epDisco.key(), &disco.CallMeMaybe{MyNumber: eps}, discoLog)
