@@ -160,6 +160,7 @@ type Conn struct {
 	relayedDataAllowed      func(peer key.NodePublic) bool
 	derpDataSuppressed      atomic.Int64
 	quicDontFragment        func(string, string, syscall.RawConn) error
+	signalingRegions        map[int]SignalingRegion
 
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
@@ -462,6 +463,11 @@ type Options struct {
 	// A nil callback preserves upstream socket creation.
 	QUICDontFragment func(network, address string, raw syscall.RawConn) error
 
+	// SignalingRegions supplies optional DERP stream dials by region ID.
+	// Each region still needs a DERP map node to supply the dial URL.
+	// Configure the map before NewConn and do not mutate it afterward.
+	SignalingRegions map[int]SignalingRegion
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -655,6 +661,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c := newConn(opts.logf())
 	c.relayedDataAllowed = opts.RelayedDataAllowed
 	c.quicDontFragment = opts.QUICDontFragment
+	c.signalingRegions = opts.SignalingRegions
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}

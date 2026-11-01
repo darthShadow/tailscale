@@ -4,15 +4,20 @@
 package magicsock
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	wgconn "github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/health"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -141,5 +146,87 @@ func TestRelayedDataAllowedPerPeer(t *testing.T) {
 				t.Fatalf("default suppressed = %d, want 0", got)
 			}
 		})
+	}
+}
+
+func TestSignalingRegionDial(t *testing.T) {
+	s := derpserver.New(key.NewNode(), t.Logf)
+	defer s.Close()
+	var calls atomic.Int32
+	dial := func(ctx context.Context, url string) (net.Conn, error) {
+		calls.Add(1)
+		if url != "https://signal.invalid/derp" {
+			return nil, fmt.Errorf("unexpected dial URL %q", url)
+		}
+		client, peer := net.Pipe()
+		go s.Accept(t.Context(), peer, bufio.NewReadWriter(bufio.NewReader(peer), bufio.NewWriter(peer)), "127.0.0.1:1")
+		return client, nil
+	}
+	opts := Options{SignalingRegions: map[int]SignalingRegion{1: {Dial: dial}}}
+	a, b := newSiloTestConn(t, opts), newSiloTestConn(t, opts)
+	for _, c := range []*Conn{a, b} {
+		c.SetDERPMapWithoutReSTUN(siloTestDERPMap())
+		if ch := c.derpWriteChanForRegion(1, key.NodePublic{}); ch == nil {
+			t.Fatal("missing region")
+		}
+		c.mu.Lock()
+		dc := c.activeDerp[1].c
+		c.mu.Unlock()
+		if dc.StreamDial == nil {
+			t.Fatal("region did not install StreamDial")
+		}
+		c.WaitReady(t)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		err := dc.Ping(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("DERP handshake: %v", err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("stream calls = %d, want 2", calls.Load())
+	}
+	if !s.IsClientConnectedForTest(a.privateKey.Public()) || !s.IsClientConnectedForTest(b.privateKey.Public()) {
+		t.Fatal("clients not registered")
+	}
+	// A Ping is encrypted as a disco frame; a Pong over this same region
+	// proves both directions pass through magicsock's region transport.
+	var peerNode tailcfg.NodeView
+	for i, pair := range [][2]*Conn{{a, b}, {b, a}} {
+		c, peer := pair[0], pair[1]
+		node := (&tailcfg.Node{ID: tailcfg.NodeID(i + 1), Name: "peer.test", Key: peer.privateKey.Public(), DiscoKey: peer.discoAtomic.Public(), HomeDERP: 1}).View()
+		c.mu.Lock()
+		c.upsertPeerLocked(node, debugFlags{}, 1)
+		c.mu.Unlock()
+		if c == a {
+			peerNode = node
+		}
+		fns, _, err := c.Bind().Open(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			fns[len(fns)-1](make([]byte, 2048), make([]wgconn.ReceivedPacket, 1))
+		}()
+		t.Cleanup(func() {
+			c.Bind().Close()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("DERP receive did not close")
+			}
+		})
+	}
+	pong := make(chan *ipnstate.PingResult, 1)
+	a.Ping(peerNode, new(ipnstate.PingResult), 0, func(res *ipnstate.PingResult) { pong <- res })
+	select {
+	case res := <-pong:
+		if res.Err != "" || res.DERPRegionID != 1 {
+			t.Fatalf("disco round trip = %+v, want region 1", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("disco frame did not round-trip through signaling region")
 	}
 }
