@@ -156,6 +156,9 @@ type metrics struct {
 
 // A Conn routes UDP packets and actively manages a list of its endpoints.
 type Conn struct {
+	relayedDataAllowed      func(peer key.NodePublic) bool
+	derpDataSuppressed      atomic.Int64
+
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
 
@@ -447,6 +450,11 @@ func (c *Conn) dlogf(format string, a ...any) {
 
 // Options contains options for Listen.
 type Options struct {
+	// RelayedDataAllowed, when set, decides each non-disco DERP send by peer.
+	// A nil callback preserves upstream behavior. Disco and direct UDP pass
+	// independently. The callback must be safe for concurrent calls.
+	RelayedDataAllowed func(peer key.NodePublic) bool
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -638,6 +646,7 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c := newConn(opts.logf())
+	c.relayedDataAllowed = opts.RelayedDataAllowed
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}
@@ -1679,6 +1688,11 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
 		return c.sendUDP(addr, b, isDisco, isGeneveEncap)
+	}
+
+	if !isDisco && c.relayedDataAllowed != nil && !c.relayedDataAllowed(pubKey) {
+		c.derpDataSuppressed.Add(1)
+		return false, nil
 	}
 
 	regionID := tailcfg.DERPRegionID(addr.Port())
