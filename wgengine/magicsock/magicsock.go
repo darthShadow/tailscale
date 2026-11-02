@@ -162,6 +162,8 @@ type Conn struct {
 	quicDontFragment        func(string, string, syscall.RawConn) error
 	signalingRegions        map[int]SignalingRegion
 	maxCallMeMaybeEndpoints int
+	directPathRecovery      bool
+	directPathValidatedFunc func(peer key.NodePublic)
 
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
@@ -473,6 +475,15 @@ type Options struct {
 	// Zero preserves upstream's uncapped endpoint order.
 	MaxCallMeMaybeEndpoints int
 
+	// DirectPathRecovery enables prompt revalidation after endpoint changes
+	// and liveness loss. False preserves upstream path discovery.
+	DirectPathRecovery bool
+
+	// DirectPathValidatedFunc runs asynchronously when a fresh direct pong
+	// changes a peer's path from untrusted to trusted. It must be safe for
+	// concurrent calls. Nil disables the notification.
+	DirectPathValidatedFunc func(peer key.NodePublic)
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -668,6 +679,8 @@ func NewConn(opts Options) (*Conn, error) {
 	c.quicDontFragment = opts.QUICDontFragment
 	c.signalingRegions = opts.SignalingRegions
 	c.maxCallMeMaybeEndpoints = opts.MaxCallMeMaybeEndpoints
+	c.directPathRecovery = opts.DirectPathRecovery
+	c.directPathValidatedFunc = opts.DirectPathValidatedFunc
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}
@@ -972,9 +985,36 @@ func (c *Conn) updateEndpoints(why string) {
 		return
 	}
 
+	c.setEndpointsAndNotify(endpoints)
+}
+
+func (c *Conn) setEndpointsAndNotify(endpoints []tailcfg.Endpoint) {
 	if c.setEndpoints(endpoints) {
 		c.logEndpointChange(endpoints)
 		c.epFunc(endpoints)
+		if c.directPathRecovery {
+			var peers []struct {
+				de       *endpoint
+				derpAddr netip.AddrPort
+			}
+			now := mono.Now()
+			c.mu.Lock()
+			c.peerMap.forEachEndpoint(func(de *endpoint) {
+				de.mu.Lock()
+				defer de.mu.Unlock()
+				if de.derpAddr.IsValid() && (de.dataActiveLocked(now) || de.recoveryEpisodeRetryLocked(now)) {
+					peers = append(peers, struct {
+						de       *endpoint
+						derpAddr netip.AddrPort
+					}{de, de.derpAddr})
+				}
+			})
+			c.mu.Unlock()
+			c.logf("magicsock: announcing new endpoints to %d active peers", len(peers))
+			for _, peer := range peers {
+				c.enqueueCallMeMaybe(peer.derpAddr, peer.de)
+			}
+		}
 	}
 }
 

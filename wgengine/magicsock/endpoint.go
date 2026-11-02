@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -92,6 +93,10 @@ type endpoint struct {
 	bestAddr           addrQuality // best non-DERP path; zero if none; mutate via setBestAddrLocked()
 	bestAddrAt         mono.Time   // time best address re-confirmed
 	trustBestAddrUntil mono.Time   // time when bestAddr expires
+	freshAfter         mono.Time   // earliest ping whose pong may validate the current recovery episode
+	lastSendData       mono.Time   // last outgoing data packet, excluding disco pings
+	firstUnansweredAt  mono.Time   // first unanswered ping to the trusted direct path
+	livenessTimer      *time.Timer
 	sentPing           map[stun.TxID]sentPing
 	endpointState      map[netip.AddrPort]*endpointState // netip.AddrPort type for key (instead of [epAddr]) as [endpointState] is irrelevant for Geneve-encapsulated paths
 	isCallMeMaybeEP    map[netip.AddrPort]bool
@@ -105,6 +110,62 @@ type endpoint struct {
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only. Must not be changed after initializing the endpont.
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
+}
+
+const directPathHeartbeatInterval = 500 * time.Millisecond
+
+func (de *endpoint) dataActiveLocked(now mono.Time) bool {
+	return !de.lastSendData.IsZero() && now.Sub(de.lastSendData) < 5*time.Second
+}
+
+func (de *endpoint) recoveryEpisodeRetryLocked(now mono.Time) bool {
+	return de.bestAddrAt.Before(de.freshAfter) && now.Sub(de.freshAfter) < 5*time.Second
+}
+
+// revalidateLocked expires trust while retaining the current path and its
+// latency. A nil targets sequence leaves pinging to handleCallMeMaybe's loop.
+func (de *endpoint) revalidateLocked(now mono.Time, targets iter.Seq[netip.AddrPort], source string) {
+	de.trustBestAddrUntil = now
+	if !de.bestAddrAt.Before(de.freshAfter) {
+		de.freshAfter = now
+		de.c.logf("magicsock: disco: node %v revalidate (%s)", de.publicKey.ShortString(), source)
+	}
+	if targets != nil {
+		for addr := range targets {
+			if st := de.endpointState[addr]; st != nil {
+				st.lastPing = 0
+				de.startDiscoPingLocked(epAddr{ap: addr}, now, pingDiscovery, 0, nil)
+			}
+		}
+	}
+}
+
+func (de *endpoint) stopLivenessLocked() {
+	de.firstUnansweredAt = 0
+	if de.livenessTimer != nil {
+		de.livenessTimer.Stop()
+		de.livenessTimer = nil
+	}
+}
+
+func (de *endpoint) armLivenessLocked(addr epAddr, now mono.Time) {
+	if !de.c.directPathRecovery || !de.dataActiveLocked(now) || !addr.isDirect() ||
+		addr != de.bestAddr.epAddr || !now.Before(de.trustBestAddrUntil) || !de.firstUnansweredAt.IsZero() {
+		return
+	}
+	de.firstUnansweredAt = now
+	de.livenessTimer = time.AfterFunc(max(time.Second, 3*de.bestAddr.latency), func() {
+		de.mu.Lock()
+		if de.firstUnansweredAt != now || de.bestAddr.epAddr != addr || !mono.Now().Before(de.trustBestAddrUntil) {
+			de.mu.Unlock()
+			return
+		}
+		de.revalidateLocked(mono.Now(), maps.Keys(de.endpointState), "liveness")
+		de.firstUnansweredAt = 0
+		de.livenessTimer = nil
+		de.mu.Unlock()
+		go de.c.ReSTUN("direct-path-lost")
+	})
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -929,7 +990,12 @@ func (de *endpoint) heartbeat() {
 		de.startDiscoPingLocked(udpAddr, now, pingHeartbeat, 0, nil)
 	}
 
-	if de.wantFullPingLocked(now) {
+	if de.c.directPathRecovery && de.recoveryEpisodeRetryLocked(now) {
+		for _, st := range de.endpointState {
+			st.lastPing = 0
+		}
+		de.sendDiscoPingsLocked(now, false)
+	} else if de.wantFullPingLocked(now) {
 		de.sendDiscoPingsLocked(now, true)
 	}
 
@@ -937,7 +1003,11 @@ func (de *endpoint) heartbeat() {
 		de.discoverUDPRelayPathsLocked(now)
 	}
 
-	de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
+	interval := heartbeatInterval
+	if de.c.directPathRecovery && de.dataActiveLocked(now) {
+		interval = directPathHeartbeatInterval
+	}
+	de.heartBeatTimer = time.AfterFunc(interval, de.heartbeat)
 }
 
 // setHeartbeatDisabled sets heartbeatDisabled to the provided value.
@@ -1112,6 +1182,13 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 
 	now := mono.Now()
+	if de.c.directPathRecovery && !de.dataActiveLocked(now) && !de.heartbeatDisabled {
+		if de.heartBeatTimer != nil {
+			de.heartBeatTimer.Stop()
+		}
+		de.heartBeatTimer = time.AfterFunc(directPathHeartbeatInterval, de.heartbeat)
+	}
+	de.lastSendData = now
 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now)
 
 	if !hasUDPTransport {
@@ -1375,6 +1452,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 		}
 		st.lastPing = now
 	}
+	de.armLivenessLocked(ep, now)
 
 	// If we are doing a discovery ping or a CLI ping with no specified size
 	// to a non DERP address, then probe the MTU. Otherwise just send the
@@ -1789,6 +1867,13 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 			What: "updateFromNode-new-Endpoints",
 			To:   newIpps,
 		})
+		if de.c.directPathRecovery {
+			targets := newIpps
+			if !slices.Contains(targets, de.bestAddr.ap) {
+				targets = append(targets, de.bestAddr.ap)
+			}
+			de.revalidateLocked(mono.Now(), slices.Values(targets), "netmap")
+		}
 	}
 
 	// Now delete anything unless it's still in the network map or
@@ -1829,6 +1914,9 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 	de.endpointState[ep] = &endpointState{
 		lastGotPing:     time.Now(),
 		lastGotPingTxID: forRxPingTxID,
+	}
+	if de.c.directPathRecovery {
+		de.revalidateLocked(mono.Now(), slices.Values([]netip.AddrPort{ep, de.bestAddr.ap}), "ping")
 	}
 
 	// If for some reason this gets very large, do some cleanup.
@@ -1877,10 +1965,15 @@ func (de *endpoint) noteConnectivityChange() {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
-	de.clearBestAddrLocked()
+	if !de.c.directPathRecovery {
+		de.clearBestAddrLocked()
+	}
 
 	for k := range de.endpointState {
 		de.endpointState[k].clear()
+	}
+	if de.c.directPathRecovery {
+		de.revalidateLocked(mono.Now(), maps.Keys(de.endpointState), "rebind")
 	}
 }
 
@@ -1986,16 +2079,23 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		}
 		go sp.resCB.cb(sp.resCB.res)
 	}
+	if de.c.directPathRecovery && sp.at.Before(de.freshAfter) {
+		return
+	}
 
 	// Promote this pong response to our current best address if it's lower latency.
 	// TODO(bradfitz): decide how latency vs. preference order affects decision
 	if hasUDPTransport && !isDerp {
+		wasTrusted := now.Before(de.trustBestAddrUntil)
 		thisPong := addrQuality{
 			epAddr:  sp.to,
 			latency: latency,
 			wireMTU: pingSizeToPktLen(sp.size, sp.to),
 		}
 		bestUntrusted := now.After(de.trustBestAddrUntil)
+		if de.c.directPathRecovery {
+			bestUntrusted = !wasTrusted
+		}
 		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 			de.debugUpdates.Add(EndpointChange{
@@ -2016,6 +2116,12 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			de.bestAddr.latency = latency
 			de.bestAddrAt = now
 			de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
+			if thisPong.isDirect() {
+				de.stopLivenessLocked()
+				if fn := de.c.directPathValidatedFunc; fn != nil && !wasTrusted && now.Before(de.trustBestAddrUntil) {
+					go fn(de.publicKey)
+				}
+			}
 		}
 	}
 	return
@@ -2176,6 +2282,9 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 		}
 	}
 	if len(newEPs) > 0 {
+		if de.c.directPathRecovery {
+			de.revalidateLocked(mono.Now(), nil, "callmemaybe")
+		}
 		de.debugUpdates.Add(EndpointChange{
 			When: time.Now(),
 			What: "handleCallMeMaybe-new-endpoints",
@@ -2199,6 +2308,12 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	for ep, want := range de.isCallMeMaybeEP {
 		if !want {
 			delete(de.isCallMeMaybeEP, ep)
+			if de.c.directPathRecovery && de.bestAddr.epAddr == (epAddr{ap: ep}) {
+				if st := de.endpointState[ep]; st != nil {
+					st.callMeMaybeTime = time.Time{}
+				}
+				continue
+			}
 			de.deleteEndpointLocked("handleCallMeMaybe", ep)
 		}
 	}
@@ -2284,6 +2399,7 @@ func (de *endpoint) stopAndReset() {
 // DERP-only endpoint. It does not stop the endpoint's heartbeat
 // timer, if one is running.
 func (de *endpoint) resetLocked() {
+	de.stopLivenessLocked()
 	de.clearBestAddrLocked()
 	de.invalidateDiscoPathLocked()
 }
