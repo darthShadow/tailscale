@@ -605,7 +605,12 @@ func (st *endpointState) addPongReplyLocked(r pongReply) {
 	st.recentPong = i
 }
 
-func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) {
+// deleteEndpointLocked reports whether it deletes ep. Recovery retains the
+// current best for probing until the upstream ping timeout clears it.
+func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) bool {
+	if de.c.directPathRecovery && de.bestAddr.epAddr == (epAddr{ap: ep}) {
+		return false
+	}
 	de.debugUpdates.Add(EndpointChange{
 		When: time.Now(),
 		What: "deleteEndpointLocked-" + why,
@@ -621,6 +626,7 @@ func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) {
 		})
 		de.setBestAddrLocked(addrQuality{})
 	}
+	return true
 }
 
 // initFakeUDPAddr populates fakeWGAddr with a globally unique fake UDPAddr.
@@ -1505,8 +1511,7 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 	de.lastFullPing = now
 	var sentAny bool
 	for ep, st := range de.endpointState {
-		if st.shouldDeleteLocked() {
-			de.deleteEndpointLocked("sendPingsLocked", ep)
+		if st.shouldDeleteLocked() && de.deleteEndpointLocked("sendPingsLocked", ep) {
 			continue
 		}
 		if runtime.GOOS == "js" {
@@ -2308,11 +2313,8 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	for ep, want := range de.isCallMeMaybeEP {
 		if !want {
 			delete(de.isCallMeMaybeEP, ep)
-			if de.c.directPathRecovery && de.bestAddr.epAddr == (epAddr{ap: ep}) {
-				if st := de.endpointState[ep]; st != nil {
-					st.callMeMaybeTime = time.Time{}
-				}
-				continue
+			if st := de.endpointState[ep]; st != nil {
+				st.callMeMaybeTime = time.Time{}
 			}
 			de.deleteEndpointLocked("handleCallMeMaybe", ep)
 		}

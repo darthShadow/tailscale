@@ -272,27 +272,87 @@ func TestDirectPathRecoveryNewEndpoint(t *testing.T) {
 			})
 		})
 	}
+	for _, source := range []string{"netmap", "callmemaybe-only"} {
+		for _, enabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("callmemaybe-omits-%s-best/enabled=%t", source, enabled), func(t *testing.T) {
+				recoverySynctest(t, func(t *testing.T) {
+					_, de, _ := recoveryTestEndpoint(t, enabled)
+					best, trust := de.bestAddr, de.trustBestAddrUntil
+					de.handleCallMeMaybe(&disco.CallMeMaybe{MyNumber: []netip.AddrPort{best.ap}})
+					synctest.Wait()
+					if source == "callmemaybe-only" {
+						de.mu.Lock()
+						de.setEndpointsLocked(views.SliceOf([]netip.AddrPort{}))
+						de.mu.Unlock()
+						if de.bestAddr != best || de.endpointState[best.ap] == nil {
+							t.Fatal("setup did not retain the CallMeMaybe-only best")
+						}
+					}
+					time.Sleep(time.Millisecond)
+					now := mono.Now()
+					de.handleCallMeMaybe(&disco.CallMeMaybe{})
+					synctest.Wait()
+					st, exists := de.endpointState[best.ap]
+					if enabled {
+						if de.bestAddr != best || de.trustBestAddrUntil != trust || !exists {
+							t.Fatalf("omission: best=%v trust=%v entry=%t, want %v, %v, true", de.bestAddr, de.trustBestAddrUntil, exists, best, trust)
+						}
+						if _, marked := de.isCallMeMaybeEP[best.ap]; marked || !st.callMeMaybeTime.IsZero() || st.lastPing != now {
+							t.Errorf("kept entry: map mark=%t callMeMaybeTime=%v lastPing=%v, want false, zero, %v", marked, st.callMeMaybeTime, st.lastPing, now)
+						}
+						if source == "callmemaybe-only" {
+							de.addCandidateEndpoint(newAddr, stun.NewTxID())
+							de.mu.Lock()
+							de.lastSendData, de.lastSendExt = now, now
+							de.mu.Unlock()
+							de.heartbeat()
+							time.Sleep(directPathHeartbeatInterval)
+							synctest.Wait()
+							de.mu.Lock()
+							st := de.endpointState[best.ap]
+							retained := st != nil && st.lastPing == mono.Now() && de.bestAddr == best
+							de.mu.Unlock()
+							if !retained {
+								t.Fatal("episode retry did not retain and ping the omitted best")
+							}
+							time.Sleep(pingTimeoutDuration - directPathHeartbeatInterval)
+							synctest.Wait()
+							de.mu.Lock()
+							cleared := !de.bestAddr.ap.IsValid()
+							de.mu.Unlock()
+							if !cleared {
+								t.Fatal("upstream ping timeout retained the untrusted best")
+							}
+							de.mu.Lock()
+							de.sendDiscoPingsLocked(mono.Now(), false)
+							pruned := de.endpointState[best.ap] == nil
+							de.mu.Unlock()
+							if !pruned {
+								t.Error("next prune kept the cleared best's entry")
+							}
+						}
+					} else if exists || de.bestAddr.ap.IsValid() {
+						t.Errorf("option off: entry=%t best=%v, want deleted and cleared", exists, de.bestAddr)
+					}
+				})
+			})
+		}
+	}
 	for _, enabled := range []bool{true, false} {
-		t.Run(fmt.Sprintf("callmemaybe-omits-netmap-best/enabled=%t", enabled), func(t *testing.T) {
+		t.Run(fmt.Sprintf("netmap-removes-best/enabled=%t", enabled), func(t *testing.T) {
 			recoverySynctest(t, func(t *testing.T) {
 				_, de, _ := recoveryTestEndpoint(t, enabled)
-				best, trust := de.bestAddr, de.trustBestAddrUntil
-				de.handleCallMeMaybe(&disco.CallMeMaybe{MyNumber: []netip.AddrPort{best.ap}})
-				synctest.Wait()
-				time.Sleep(time.Millisecond)
-				now := mono.Now()
-				de.handleCallMeMaybe(&disco.CallMeMaybe{})
-				synctest.Wait()
-				st, exists := de.endpointState[best.ap]
-				if enabled {
-					if de.bestAddr != best || de.trustBestAddrUntil != trust || !exists {
-						t.Fatalf("omission: best=%v trust=%v entry=%t, want %v, %v, true", de.bestAddr, de.trustBestAddrUntil, exists, best, trust)
-					}
-					if _, marked := de.isCallMeMaybeEP[best.ap]; marked || !st.callMeMaybeTime.IsZero() || st.lastPing != now {
-						t.Errorf("kept entry: map mark=%t callMeMaybeTime=%v lastPing=%v, want false, zero, %v", marked, st.callMeMaybeTime, st.lastPing, now)
-					}
-				} else if exists || de.bestAddr.ap.IsValid() {
-					t.Errorf("option off: entry=%t best=%v, want deleted and cleared", exists, de.bestAddr)
+				best := de.bestAddr
+				de.mu.Lock()
+				de.setEndpointsLocked(views.SliceOf([]netip.AddrPort{}))
+				_, exists := de.endpointState[best.ap]
+				got := de.bestAddr
+				de.mu.Unlock()
+				if enabled && (got != best || !exists) {
+					t.Errorf("option on: best=%v entry=%t, want %v retained", got, exists, best)
+				}
+				if !enabled && (exists || got.ap.IsValid()) {
+					t.Errorf("option off: best=%v entry=%t, want deleted and cleared", got, exists)
 				}
 			})
 		})
@@ -392,6 +452,31 @@ func TestDirectPathRecoveryAnnouncesEndpoints(t *testing.T) {
 	}
 }
 
+type recoveryLivenessState struct {
+	bestAddr                                                        addrQuality
+	lastSendData, freshAfter, trustBestAddrUntil, firstUnansweredAt mono.Time
+	heartBeatTimer                                                  *time.Timer
+	lastPing                                                        map[netip.AddrPort]mono.Time
+}
+
+func recoveryTestLivenessState(de *endpoint) recoveryLivenessState {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	state := recoveryLivenessState{
+		bestAddr:           de.bestAddr,
+		lastSendData:       de.lastSendData,
+		freshAfter:         de.freshAfter,
+		trustBestAddrUntil: de.trustBestAddrUntil,
+		firstUnansweredAt:  de.firstUnansweredAt,
+		heartBeatTimer:     de.heartBeatTimer,
+		lastPing:           make(map[netip.AddrPort]mono.Time, len(de.endpointState)),
+	}
+	for addr, st := range de.endpointState {
+		state.lastPing[addr] = st.lastPing
+	}
+	return state
+}
+
 func TestDirectPathRecoveryLiveness(t *testing.T) {
 	recoveryTestTimeouts(t)
 	for _, latency := range []time.Duration{350 * time.Millisecond, 500 * time.Millisecond, 525 * time.Millisecond} {
@@ -405,40 +490,40 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 				if err := de.send([][]byte{make([]byte, packet.GeneveFixedHeaderLength+4)}, packet.GeneveFixedHeaderLength); err != nil {
 					t.Fatal(err)
 				}
-				if de.lastSendData != start {
-					t.Errorf("lastSendData=%v, want %v", de.lastSendData, start)
+				if state := recoveryTestLivenessState(de); state.lastSendData != start {
+					t.Errorf("lastSendData=%v, want %v", state.lastSendData, start)
 				}
 				time.Sleep(500 * time.Millisecond)
 				synctest.Wait()
-				if de.endpointState[best.ap].lastPing != mono.Now() {
-					t.Errorf("first heartbeat lastPing=%v, want %v", de.endpointState[best.ap].lastPing, mono.Now())
+				if state := recoveryTestLivenessState(de); state.lastPing[best.ap] != mono.Now() {
+					t.Errorf("first heartbeat lastPing=%v, want %v", state.lastPing[best.ap], mono.Now())
 				}
 				first := start.Add(500 * time.Millisecond)
 				time.Sleep(500 * time.Millisecond)
 				synctest.Wait()
-				if de.endpointState[best.ap].lastPing != mono.Now() || de.firstUnansweredAt != first {
-					t.Errorf("second beat lastPing=%v firstUnansweredAt=%v, want %v and %v", de.endpointState[best.ap].lastPing, de.firstUnansweredAt, mono.Now(), first)
+				if state := recoveryTestLivenessState(de); state.lastPing[best.ap] != mono.Now() || state.firstUnansweredAt != first {
+					t.Errorf("second beat lastPing=%v firstUnansweredAt=%v, want %v and %v", state.lastPing[best.ap], state.firstUnansweredAt, mono.Now(), first)
 				}
 				deadline := first.Add(max(time.Second, 3*latency))
 				time.Sleep(deadline.Sub(mono.Now()) - time.Nanosecond)
 				synctest.Wait()
-				if why := recoveryTestReSTUN(c); why != "" || de.freshAfter != 0 {
-					t.Errorf("loss before L: ReSTUN=%q freshAfter=%v", why, de.freshAfter)
+				if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "" || state.freshAfter != 0 {
+					t.Errorf("loss before L: ReSTUN=%q freshAfter=%v", why, state.freshAfter)
 				}
 				time.Sleep(time.Nanosecond)
 				synctest.Wait()
-				if why := recoveryTestReSTUN(c); why != "direct-path-lost" || de.freshAfter != deadline || de.trustBestAddrUntil != deadline || de.bestAddr != best || !de.firstUnansweredAt.IsZero() {
-					t.Errorf("at L: ReSTUN=%q freshAfter=%v trust=%v best=%v firstUnanswered=%v", why, de.freshAfter, de.trustBestAddrUntil, de.bestAddr, de.firstUnansweredAt)
+				if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "direct-path-lost" || state.freshAfter != deadline || state.trustBestAddrUntil != deadline || state.bestAddr != best || !state.firstUnansweredAt.IsZero() {
+					t.Errorf("at L: ReSTUN=%q freshAfter=%v trust=%v best=%v firstUnanswered=%v", why, state.freshAfter, state.trustBestAddrUntil, state.bestAddr, state.firstUnansweredAt)
 				}
-				for addr, st := range de.endpointState {
-					if st.lastPing != deadline {
-						t.Errorf("candidate %v lastPing=%v, want %v", addr, st.lastPing, deadline)
+				for addr, lastPing := range recoveryTestLivenessState(de).lastPing {
+					if lastPing != deadline {
+						t.Errorf("candidate %v lastPing=%v, want %v", addr, lastPing, deadline)
 					}
 				}
 				time.Sleep(2 * time.Second)
 				synctest.Wait()
-				if de.freshAfter != deadline {
-					t.Errorf("untrusted endpoint opened a second B episode at %v", de.freshAfter)
+				if state := recoveryTestLivenessState(de); state.freshAfter != deadline {
+					t.Errorf("untrusted endpoint opened a second B episode at %v", state.freshAfter)
 				}
 			})
 		})
@@ -461,24 +546,24 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 				}
 				de.heartbeat()
 				synctest.Wait()
-				fresh := de.freshAfter
+				fresh := recoveryTestLivenessState(de).freshAfter
 				if row != "already-untrusted" {
 					time.Sleep(3*time.Second - time.Nanosecond)
 					synctest.Wait()
-					if de.endpointState[de.bestAddr.ap].lastPing != start {
-						t.Errorf("idle or option-off heartbeat fired before 3s: %v", de.endpointState[de.bestAddr.ap].lastPing)
+					if state := recoveryTestLivenessState(de); state.lastPing[state.bestAddr.ap] != start {
+						t.Errorf("idle or option-off heartbeat fired before 3s: %v", state.lastPing[state.bestAddr.ap])
 					}
 					time.Sleep(time.Nanosecond)
 					synctest.Wait()
-					if de.endpointState[de.bestAddr.ap].lastPing != mono.Now() {
-						t.Errorf("heartbeat did not fire at 3s: %v", de.endpointState[de.bestAddr.ap].lastPing)
+					if state := recoveryTestLivenessState(de); state.lastPing[state.bestAddr.ap] != mono.Now() {
+						t.Errorf("heartbeat did not fire at 3s: %v", state.lastPing[state.bestAddr.ap])
 					}
 				} else {
 					time.Sleep(2 * time.Second)
 					synctest.Wait()
 				}
-				if why := recoveryTestReSTUN(c); why != "" || de.freshAfter != fresh || !de.firstUnansweredAt.IsZero() {
-					t.Errorf("unexpected B: ReSTUN=%q freshAfter=%v firstUnanswered=%v", why, de.freshAfter, de.firstUnansweredAt)
+				if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "" || state.freshAfter != fresh || !state.firstUnansweredAt.IsZero() {
+					t.Errorf("unexpected B: ReSTUN=%q freshAfter=%v firstUnanswered=%v", why, state.freshAfter, state.firstUnansweredAt)
 				}
 			})
 		})
@@ -497,16 +582,16 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 					}
 					at := mono.Now()
 					time.Sleep(latency)
-					recoveryTestPong(t, de, de.bestAddr.ap, at, 0)
-					if !de.firstUnansweredAt.IsZero() {
-						t.Errorf("pong did not clear unanswered ping: %v", de.firstUnansweredAt)
+					recoveryTestPong(t, de, recoveryTestLivenessState(de).bestAddr.ap, at, 0)
+					if state := recoveryTestLivenessState(de); !state.firstUnansweredAt.IsZero() {
+						t.Errorf("pong did not clear unanswered ping: %v", state.firstUnansweredAt)
 					}
 					// Stop automatic beats to isolate the timer the answered ping armed.
-					de.heartBeatTimer.Stop()
+					recoveryTestLivenessState(de).heartBeatTimer.Stop()
 					time.Sleep(start.Add(3*latency).Sub(mono.Now()) + time.Nanosecond)
 					synctest.Wait()
-					if why := recoveryTestReSTUN(c); why != "" || de.freshAfter != 0 {
-						t.Errorf("answered heartbeat caused B: ReSTUN=%q freshAfter=%v", why, de.freshAfter)
+					if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "" || state.freshAfter != 0 {
+						t.Errorf("answered heartbeat caused B: ReSTUN=%q freshAfter=%v", why, state.freshAfter)
 					}
 				})
 			})
@@ -522,13 +607,13 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 			de.startDiscoPingLocked(de.bestAddr.epAddr, start, pingCLI, 0, nil)
 			de.mu.Unlock()
 			time.Sleep(350 * time.Millisecond)
-			recoveryTestPong(t, de, de.bestAddr.ap, start.Add(-time.Millisecond), 0)
+			recoveryTestPong(t, de, recoveryTestLivenessState(de).bestAddr.ap, start.Add(-time.Millisecond), 0)
 			de.mu.Lock()
 			de.startDiscoPingLocked(de.bestAddr.epAddr, mono.Now(), pingHeartbeat, 0, nil)
 			de.mu.Unlock()
-			deadline := mono.Now().Add(3 * de.bestAddr.latency)
-			if de.heartBeatTimer != nil {
-				de.heartBeatTimer.Stop()
+			deadline := mono.Now().Add(3 * recoveryTestLivenessState(de).bestAddr.latency)
+			if state := recoveryTestLivenessState(de); state.heartBeatTimer != nil {
+				state.heartBeatTimer.Stop()
 			}
 			time.Sleep(deadline.Sub(mono.Now()) - time.Nanosecond)
 			synctest.Wait()
@@ -537,8 +622,8 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 			}
 			time.Sleep(time.Nanosecond)
 			synctest.Wait()
-			if why := recoveryTestReSTUN(c); why != "direct-path-lost" || de.freshAfter != deadline {
-				t.Errorf("new unanswered ping: ReSTUN=%q freshAfter=%v, want direct-path-lost and %v", why, de.freshAfter, deadline)
+			if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "direct-path-lost" || state.freshAfter != deadline {
+				t.Errorf("new unanswered ping: ReSTUN=%q freshAfter=%v, want direct-path-lost and %v", why, state.freshAfter, deadline)
 			}
 		})
 	})
@@ -553,19 +638,19 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 			for i := 1; i < 10; i++ {
 				time.Sleep(500 * time.Millisecond)
 				synctest.Wait()
-				if de.endpointState[other].lastPing != mono.Now() {
-					t.Errorf("beat %d candidate lastPing=%v, want %v", i, de.endpointState[other].lastPing, mono.Now())
+				if state := recoveryTestLivenessState(de); state.lastPing[other] != mono.Now() {
+					t.Errorf("beat %d candidate lastPing=%v, want %v", i, state.lastPing[other], mono.Now())
 				}
 			}
 			time.Sleep(500 * time.Millisecond)
 			synctest.Wait()
-			if de.endpointState[other].lastPing != start.Add(4500*time.Millisecond) {
-				t.Errorf("candidate limit bypassed after 5s: lastPing=%v", de.endpointState[other].lastPing)
+			if state := recoveryTestLivenessState(de); state.lastPing[other] != start.Add(4500*time.Millisecond) {
+				t.Errorf("candidate limit bypassed after 5s: lastPing=%v", state.lastPing[other])
 			}
-			de.heartBeatTimer.Stop()
+			recoveryTestLivenessState(de).heartBeatTimer.Stop()
 			de.heartBeatTimer = nil
-			if de.bestAddr.ap.IsValid() {
-				t.Errorf("ping timeout retained the untrusted dead best address %v", de.bestAddr)
+			if state := recoveryTestLivenessState(de); state.bestAddr.ap.IsValid() {
+				t.Errorf("ping timeout retained the untrusted dead best address %v", state.bestAddr)
 			}
 			recoveryTestPong(t, de, other, mono.Now().Add(-time.Millisecond), 0)
 			// Episode alone uses the normal cadence; a new data send restarts fast beats.
@@ -574,11 +659,11 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 			}
 			time.Sleep(500 * time.Millisecond)
 			synctest.Wait()
-			if de.heartBeatTimer == nil {
+			if state := recoveryTestLivenessState(de); state.heartBeatTimer == nil {
 				t.Error("data after idle did not restart heartbeats")
 			}
-			if de.endpointState[other].lastPing != mono.Now() {
-				t.Errorf("data after idle: heartbeat at %v, want %v", de.endpointState[other].lastPing, mono.Now())
+			if state := recoveryTestLivenessState(de); state.lastPing[other] != mono.Now() {
+				t.Errorf("data after idle: heartbeat at %v, want %v", state.lastPing[other], mono.Now())
 			}
 		})
 	})
@@ -592,7 +677,7 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 				case "armed", "stopped":
 					de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
 					if timerState == "stopped" {
-						de.heartBeatTimer.Stop()
+						recoveryTestLivenessState(de).heartBeatTimer.Stop()
 					}
 				case "disabled":
 					de.heartbeatDisabled = true
@@ -606,7 +691,8 @@ func TestDirectPathRecoveryLiveness(t *testing.T) {
 				if timerState == "disabled" {
 					want = start
 				}
-				if got := de.endpointState[de.bestAddr.ap].lastPing; got != want {
+				state := recoveryTestLivenessState(de)
+				if got := state.lastPing[state.bestAddr.ap]; got != want {
 					t.Errorf("first data heartbeat at %v, want %v", got, want)
 				}
 			})
