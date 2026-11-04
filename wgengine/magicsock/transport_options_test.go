@@ -29,30 +29,30 @@ import (
 
 // These listeners implement the packet boundary entirely in memory. In
 // particular, NewConn must not open UDP sockets in the pipe-based tests.
-type siloPacketListener struct{}
+type idlePacketListener struct{}
 
-func (siloPacketListener) ListenPacket(context.Context, string, string) (net.PacketConn, error) {
-	return &siloPacketConn{blockForeverConn: newBlockForeverConn()}, nil
+func (idlePacketListener) ListenPacket(context.Context, string, string) (net.PacketConn, error) {
+	return &idlePacketConn{blockForeverConn: newBlockForeverConn()}, nil
 }
 
-type siloPacketConn struct{ *blockForeverConn }
+type idlePacketConn struct{ *blockForeverConn }
 
-func (c *siloPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+func (c *idlePacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, ap, err := c.ReadFromUDPAddrPort(b)
 	return n, net.UDPAddrFromAddrPort(ap), err
 }
 
-func (c *siloPacketConn) WriteTo(b []byte, a net.Addr) (int, error) {
+func (c *idlePacketConn) WriteTo(b []byte, a net.Addr) (int, error) {
 	return c.WriteToUDPAddrPort(b, a.(*net.UDPAddr).AddrPort())
 }
 
-func newSiloTestConn(t *testing.T, opts Options) *Conn {
+func newPacketListenerTestConn(t *testing.T, opts Options) *Conn {
 	t.Helper()
-	opts.TestOnlyPacketListener = siloPacketListener{}
-	return newSiloConn(t, opts)
+	opts.TestOnlyPacketListener = idlePacketListener{}
+	return newConfiguredTestConn(t, opts)
 }
 
-func newSiloConn(t *testing.T, opts Options) *Conn {
+func newConfiguredTestConn(t *testing.T, opts Options) *Conn {
 	t.Helper()
 	bus := eventbustest.NewBus(t)
 	opts.EventBus = bus
@@ -72,7 +72,7 @@ func newSiloConn(t *testing.T, opts Options) *Conn {
 	return c
 }
 
-func siloTestDERPMap() *tailcfg.DERPMap {
+func signalingDERPMap() *tailcfg.DERPMap {
 	return &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 		1: {RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{
 			{Name: "test", RegionID: 1, HostName: "signal.invalid", IPv4: "none", IPv6: "none"},
@@ -80,8 +80,8 @@ func siloTestDERPMap() *tailcfg.DERPMap {
 	}}
 }
 
-func captureSiloDERPWrites(c *Conn) chan derpWriteRequest {
-	c.derpMap = siloTestDERPMap()
+func captureDERPDataWrites(c *Conn) chan derpWriteRequest {
+	c.derpMap = signalingDERPMap()
 	c.derpMapAtomic.Store(c.derpMap)
 	ch := make(chan derpWriteRequest, 32)
 	dc := derphttp.NewRegionClient(c.privateKey, c.logf, c.netMon, func() *tailcfg.DERPRegion { return c.derpMap.Regions[1] })
@@ -105,8 +105,8 @@ func TestRelayedDataAllowedPerPeer(t *testing.T) {
 					return peer != denied || allowDenied
 				}
 			}
-			c := newSiloTestConn(t, opts)
-			ch := captureSiloDERPWrites(c)
+			c := newPacketListenerTestConn(t, opts)
+			ch := captureDERPDataWrites(c)
 			derpAddr := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 1)
 			for _, peer := range []key.NodePublic{denied, allowed} {
 				for _, isDisco := range []bool{false, true} {
@@ -151,7 +151,7 @@ func TestRelayedDataAllowedPerPeer(t *testing.T) {
 	}
 }
 
-func siloEndpoints(n int) []tailcfg.Endpoint {
+func orderedTestEndpoints(n int) []tailcfg.Endpoint {
 	eps := make([]tailcfg.Endpoint, n)
 	for i := range eps {
 		addr := netip.MustParseAddr("2001:db8::1")
@@ -170,7 +170,7 @@ func siloEndpoints(n int) []tailcfg.Endpoint {
 }
 
 func TestCapEndpointsOrder(t *testing.T) {
-	eps := siloEndpoints(8)
+	eps := orderedTestEndpoints(8)
 	eps = append(eps, tailcfg.Endpoint{Addr: netip.MustParseAddrPort("192.0.2.2:9"), Type: tailcfg.EndpointSTUN4LocalPort})
 	want := []tailcfg.Endpoint{eps[2], eps[3], eps[6], eps[7], eps[8], eps[1], eps[5], eps[0], eps[4]}
 	before := slices.Clone(eps)
@@ -194,8 +194,8 @@ func TestCallMeMaybeEndpointCap(t *testing.T) {
 		{"default", 0, 80, 80, 1520}, {"capped", 64, 80, 64, 1232}, {"short", 64, 40, 40, 800},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newSiloTestConn(t, Options{MaxCallMeMaybeEndpoints: tc.cap})
-			ch := captureSiloDERPWrites(c)
+			c := newPacketListenerTestConn(t, Options{MaxCallMeMaybeEndpoints: tc.cap})
+			ch := captureDERPDataWrites(c)
 			peerDisco := key.NewDisco()
 			node := (&tailcfg.Node{ID: 1, Key: key.NewNode().Public(), DiscoKey: peerDisco.Public(), HomeDERP: 1}).View()
 			c.mu.Lock()
@@ -205,7 +205,7 @@ func TestCallMeMaybeEndpointCap(t *testing.T) {
 			if !ok {
 				t.Fatal("missing peer")
 			}
-			c.lastEndpoints = siloEndpoints(tc.count)
+			c.lastEndpoints = orderedTestEndpoints(tc.count)
 			c.lastEndpointsTime = time.Now()
 			c.enqueueCallMeMaybe(netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 1), de)
 			select {
@@ -259,9 +259,9 @@ func TestSignalingRegionDial(t *testing.T) {
 		return client, nil
 	}
 	opts := Options{SignalingRegions: map[int]SignalingRegion{1: {Dial: dial}}}
-	a, b := newSiloTestConn(t, opts), newSiloTestConn(t, opts)
+	a, b := newPacketListenerTestConn(t, opts), newPacketListenerTestConn(t, opts)
 	for _, c := range []*Conn{a, b} {
-		c.SetDERPMapWithoutReSTUN(siloTestDERPMap())
+		c.SetDERPMapWithoutReSTUN(signalingDERPMap())
 		if ch := c.derpWriteChanForRegion(1, key.NodePublic{}); ch == nil {
 			t.Fatal("missing region")
 		}

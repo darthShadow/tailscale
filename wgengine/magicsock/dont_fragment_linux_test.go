@@ -26,7 +26,7 @@ func TestQUICDontFragmentOnRebind(t *testing.T) {
 		}
 		return sockErr
 	}
-	c := newSiloConn(t, Options{QUICDontFragment: control})
+	c := newConfiguredTestConn(t, Options{QUICDontFragment: control})
 	if !c.SupportsDF() {
 		t.Fatal("SupportsDF is false with DF control")
 	}
@@ -64,7 +64,7 @@ func TestQUICDontFragmentOnRebind(t *testing.T) {
 			}
 		}
 	}
-	if plain := newSiloConn(t, Options{}); plain.SupportsDF() {
+	if plain := newConfiguredTestConn(t, Options{}); plain.SupportsDF() {
 		t.Fatal("default SupportsDF is true")
 	}
 }

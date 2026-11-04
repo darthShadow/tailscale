@@ -44,7 +44,7 @@ func recoveryTestTimeouts(t *testing.T) {
 func recoveryTestEndpoint(t *testing.T, enabled bool) (*Conn, *endpoint, chan key.NodePublic) {
 	t.Helper()
 	validated := make(chan key.NodePublic, 16)
-	c := newSiloTestConn(t, Options{
+	c := newPacketListenerTestConn(t, Options{
 		DirectPathRecovery: enabled,
 		DirectPathValidatedFunc: func(peer key.NodePublic) {
 			validated <- peer
@@ -363,8 +363,8 @@ func TestDirectPathRecoveryAnnouncesEndpoints(t *testing.T) {
 	for _, row := range []string{"changed", "unchanged", "option-off", "no-recipients"} {
 		t.Run(row, func(t *testing.T) {
 			recoverySynctest(t, func(t *testing.T) {
-				c := newSiloTestConn(t, Options{DirectPathRecovery: row != "option-off"})
-				writes := captureSiloDERPWrites(c)
+				c := newPacketListenerTestConn(t, Options{DirectPathRecovery: row != "option-off"})
+				writes := captureDERPDataWrites(c)
 				var logs []string
 				c.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
 				peers := make(map[key.NodePublic]key.DiscoPrivate)
@@ -394,7 +394,7 @@ func TestDirectPathRecoveryAnnouncesEndpoints(t *testing.T) {
 						want[node.Key()] = true
 					}
 				}
-				endpoints := siloEndpoints(3)
+				endpoints := orderedTestEndpoints(3)
 				c.epFunc = func(got []tailcfg.Endpoint) {
 					if !slices.Equal(got, endpoints) {
 						t.Errorf("endpoint callback = %v, want %v", got, endpoints)
