@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -18,6 +19,13 @@ import (
 	"tailscale.com/syncs"
 	"tailscale.com/types/nettype"
 )
+
+// udpReceiveLifetime belongs to one bind Open. Its mutex coordinates the socket
+// snapshot for each read attempt with Close ending that Open's lifetime.
+type udpReceiveLifetime struct {
+	mu     sync.Mutex
+	closed bool
+}
 
 // RebindingUDPConn is a UDP socket that can be re-bound.
 // Unix has no notion of re-binding a socket, so we swap it out for a new one.
@@ -121,20 +129,40 @@ func (c *RebindingUDPConn) WriteWireGuardBatchTo(buffs [][]byte, addr epAddr, of
 // ReadBatch is an alias for [batching.Conn.ReadBatch] with fallback to single
 // packet operations if c.pconn is not a [batching.Conn].
 func (c *RebindingUDPConn) ReadBatch(slab []byte, batchingPackets []batching.ReceivedPacket) (int, error) {
+	return c.readBatch(slab, batchingPackets, nil)
+}
+
+// readBatch checks lifetime before each socket snapshot, including replacement
+// retries. A nil lifetime leaves reads independent of a bind Open.
+func (c *RebindingUDPConn) readBatch(slab []byte, batchingPackets []batching.ReceivedPacket, lifetime *udpReceiveLifetime) (int, error) {
 	for {
-		pconn := *c.pconnAtomic.Load()
-		b, ok := pconn.(batching.Conn)
-		if !ok {
-			n, ap, err := c.readFromWithInitPconn(pconn, slab)
+		var pconn nettype.PacketConn
+		if lifetime != nil {
+			lifetime.mu.Lock()
+			if lifetime.closed {
+				lifetime.mu.Unlock()
+				return 0, net.ErrClosed
+			}
+			pconn = *c.pconnAtomic.Load()
+			lifetime.mu.Unlock()
+		} else {
+			pconn = *c.pconnAtomic.Load()
+		}
+		var n int
+		var err error
+		if b, ok := pconn.(batching.Conn); ok {
+			n, err = b.ReadBatch(slab, batchingPackets)
+		} else {
+			var ap netip.AddrPort
+			n, ap, err = pconn.ReadFromUDPAddrPort(slab)
 			if err == nil {
 				batchingPackets[0].Offset = 0
 				batchingPackets[0].Size = n
 				batchingPackets[0].Source = netaddr.Unmap(ap)
 				return 1, nil
 			}
-			return 0, err
+			n = 0
 		}
-		n, err := b.ReadBatch(slab, batchingPackets)
 		if err != nil && pconn != c.currentConn() {
 			continue
 		}
