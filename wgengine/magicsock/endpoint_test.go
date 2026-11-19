@@ -6,6 +6,8 @@ package magicsock
 import (
 	"fmt"
 	"net/netip"
+	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -17,8 +19,716 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 	"tailscale.com/util/ringlog"
 )
+
+func recoverySynctest(t *testing.T, f func(*testing.T)) {
+	t.Helper()
+	now := time.Now()
+	synctest.Test(t, func(t *testing.T) {
+		// mono.Now derives its epoch from package initialization outside the
+		// bubble. Move the fake clock forward so its zero sentinel stays past.
+		time.Sleep(time.Until(now))
+		f(t)
+	})
+}
+
+func recoveryTestTimeouts(t *testing.T) {
+	t.Helper()
+	oldTimeout, oldInterval := pingTimeoutDuration, discoPingInterval
+	pingTimeoutDuration, discoPingInterval = 5*time.Second, 5*time.Second
+	t.Cleanup(func() { pingTimeoutDuration, discoPingInterval = oldTimeout, oldInterval })
+}
+
+func recoveryTestEndpoint(t *testing.T, enabled bool) (*Conn, *endpoint, chan key.NodePublic) {
+	t.Helper()
+	validated := make(chan key.NodePublic, 16)
+	c := newPacketListenerTestConn(t, Options{
+		DirectPathRecovery: enabled,
+		DirectPathValidatedFunc: func(peer key.NodePublic) {
+			validated <- peer
+		},
+	})
+	c.mu.Lock()
+	node := (&tailcfg.Node{ID: 1, Key: key.NewNode().Public(), DiscoKey: key.NewDisco().Public(),
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1234")}}).View()
+	c.upsertPeerLocked(node, debugFlags{}, 1)
+	de, ok := c.peerMap.endpointForNodeKey(node.Key())
+	c.endpointsUpdateActive = true // Observe ReSTUN's coalescing state without starting netcheck.
+	c.mu.Unlock()
+	if !ok {
+		t.Fatal("missing peer")
+	}
+	t.Cleanup(func() {
+		c.mu.Lock()
+		c.endpointsUpdateActive = false
+		c.mu.Unlock()
+	})
+	synctest.Wait()
+	de.mu.Lock()
+	for tx, sp := range de.sentPing {
+		sp.timer.Stop()
+		delete(de.sentPing, tx)
+	}
+	now := mono.Now()
+	de.bestAddr = addrQuality{epAddr: epAddr{ap: node.Endpoints().At(0)}, latency: 50 * time.Millisecond}
+	de.bestAddrAt = now.Add(-time.Second)
+	de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
+	de.freshAfter = 0
+	de.derpAddr = netip.AddrPort{}
+	for _, st := range de.endpointState {
+		st.lastPing = now
+	}
+	de.mu.Unlock()
+	return c, de, validated
+}
+
+func recoveryTestPong(t *testing.T, de *endpoint, addr netip.AddrPort, at mono.Time, size int) {
+	t.Helper()
+	tx := stun.NewTxID()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	de.mu.Lock()
+	de.sentPing[tx] = sentPing{to: epAddr{ap: addr}, at: at, timer: timer, purpose: pingHeartbeat, size: size}
+	de.mu.Unlock()
+	de.c.mu.Lock()
+	known := de.handlePongConnLocked(&disco.Pong{TxID: tx, Src: addr}, &discoInfo{}, epAddr{ap: addr})
+	de.c.mu.Unlock()
+	if !known {
+		t.Fatal("pong did not match its sent ping")
+	}
+	synctest.Wait()
+}
+
+func recoveryTestReSTUN(c *Conn) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wantEndpointsUpdate
+}
+
+func TestDirectPathRecoveryNewEndpoint(t *testing.T) {
+	recoveryTestTimeouts(t)
+	newAddr := netip.MustParseAddrPort("192.0.2.2:5678")
+	for _, source := range []string{"netmap", "callmemaybe", "ping", "rebind"} {
+		for _, enabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/enabled=%t", source, enabled), func(t *testing.T) {
+				recoverySynctest(t, func(t *testing.T) {
+					_, de, validated := recoveryTestEndpoint(t, enabled)
+					oldBest, oldTrust := de.bestAddr, de.trustBestAddrUntil
+					now := mono.Now()
+					switch source {
+					case "netmap":
+						de.mu.Lock()
+						de.setEndpointsLocked(views.SliceOf([]netip.AddrPort{oldBest.ap, newAddr}))
+						de.mu.Unlock()
+					case "callmemaybe":
+						de.handleCallMeMaybe(&disco.CallMeMaybe{MyNumber: []netip.AddrPort{oldBest.ap, newAddr}})
+					case "ping":
+						de.addCandidateEndpoint(newAddr, stun.NewTxID())
+					case "rebind":
+						de.mu.Lock()
+						de.endpointState[newAddr] = &endpointState{lastPing: now, recentPongs: []pongReply{{latency: time.Second}}}
+						de.mu.Unlock()
+						de.noteConnectivityChange()
+					}
+					synctest.Wait()
+					if enabled {
+						if de.bestAddr != oldBest || de.trustBestAddrUntil != now || de.freshAfter != now {
+							t.Errorf("revalidate: best=%v trust=%v freshAfter=%v; want %v, %v, %v", de.bestAddr, de.trustBestAddrUntil, de.freshAfter, oldBest, now, now)
+						}
+						for _, addr := range []netip.AddrPort{oldBest.ap, newAddr} {
+							count := 0
+							for _, sp := range de.sentPing {
+								if sp.to.ap == addr && sp.at == now && sp.purpose == pingDiscovery {
+									count++
+								}
+							}
+							if de.endpointState[addr].lastPing != now || count != 1 {
+								t.Errorf("target %v: lastPing=%v pings=%d, want %v and 1", addr, de.endpointState[addr].lastPing, count, now)
+							}
+						}
+						if source == "rebind" && len(de.endpointState[newAddr].recentPongs) != 0 {
+							t.Error("rebind retained derived candidate state")
+						}
+					} else if source == "rebind" {
+						if de.bestAddr.ap.IsValid() {
+							t.Errorf("upstream rebind retained bestAddr %v", de.bestAddr)
+						}
+					} else if de.trustBestAddrUntil != oldTrust || de.freshAfter != 0 {
+						t.Errorf("option off changed trust=%v or freshAfter=%v", de.trustBestAddrUntil, de.freshAfter)
+					}
+					if source == "rebind" {
+						return
+					}
+					time.Sleep(50 * time.Millisecond)
+					recoveryTestPong(t, de, newAddr, now, 0)
+					wantBest, wantCallbacks := oldBest.ap, 0
+					if enabled {
+						wantBest, wantCallbacks = newAddr, 1
+					}
+					if de.bestAddr.ap != wantBest || len(validated) != wantCallbacks {
+						t.Errorf("equal-latency pong: best=%v callbacks=%d, want %v and %d", de.bestAddr.ap, len(validated), wantBest, wantCallbacks)
+					}
+					if enabled {
+						if !mono.Now().Before(de.trustBestAddrUntil) || de.bestAddrAt != mono.Now() {
+							t.Error("fresh pong did not validate the peer")
+						}
+						select {
+						case peer := <-validated:
+							if peer != de.publicKey {
+								t.Errorf("validated peer=%v, want %v", peer, de.publicKey)
+							}
+						default:
+							t.Error("validated callback missing")
+						}
+					}
+				})
+			})
+		}
+	}
+	t.Run("reordered-list", func(t *testing.T) {
+		recoverySynctest(t, func(t *testing.T) {
+			_, de, validated := recoveryTestEndpoint(t, true)
+			de.endpointState[newAddr] = &endpointState{index: 1}
+			best, trust := de.bestAddr, de.trustBestAddrUntil
+			de.mu.Lock()
+			de.setEndpointsLocked(views.SliceOf([]netip.AddrPort{newAddr, best.ap}))
+			de.mu.Unlock()
+			synctest.Wait()
+			if de.bestAddr != best || de.trustBestAddrUntil != trust || de.freshAfter != 0 || len(de.sentPing) != 0 || len(validated) != 0 {
+				t.Error("reordering the same network-map endpoints changed path state")
+			}
+		})
+	})
+	for _, row := range []string{"trust-already-expired", "stale-better-path-after-validation", "stale-current-path", "second-trigger", "renewal-while-trusted", "better-path-while-trusted"} {
+		t.Run(row, func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				_, de, validated := recoveryTestEndpoint(t, true)
+				now := mono.Now()
+				oldAddr := de.bestAddr.ap
+				staleAt := now.Add(-time.Millisecond)
+				if row == "renewal-while-trusted" || row == "better-path-while-trusted" {
+					addr := oldAddr
+					if row == "better-path-while-trusted" {
+						addr = newAddr
+						de.endpointState[addr] = &endpointState{}
+					}
+					recoveryTestPong(t, de, addr, now.Add(-time.Millisecond), 0)
+					if len(validated) != 0 || de.bestAddr.ap != addr || de.bestAddrAt != now {
+						t.Errorf("trusted pong: callbacks=%d best=%v bestAddrAt=%v", len(validated), de.bestAddr, de.bestAddrAt)
+					}
+					return
+				}
+				if row == "trust-already-expired" {
+					de.trustBestAddrUntil = now.Add(-time.Second)
+				}
+				logs := make(chan string, 16)
+				if row == "second-trigger" {
+					de.c.logf = func(format string, args ...any) { logs <- fmt.Sprintf(format, args...) }
+				}
+				de.addCandidateEndpoint(newAddr, stun.NewTxID())
+				synctest.Wait()
+				if row == "second-trigger" {
+					time.Sleep(time.Millisecond)
+					de.addCandidateEndpoint(netip.MustParseAddrPort("192.0.2.3:9"), stun.NewTxID())
+					synctest.Wait()
+					if de.freshAfter != now || de.trustBestAddrUntil != mono.Now() {
+						t.Errorf("second trigger: freshAfter=%v trust=%v, want %v and %v", de.freshAfter, de.trustBestAddrUntil, now, mono.Now())
+					}
+					var episodes []string
+					for len(logs) > 0 {
+						if line := <-logs; strings.Contains(line, " revalidate (") {
+							episodes = append(episodes, line)
+						}
+					}
+					wantLog := fmt.Sprintf("magicsock: disco: node %v revalidate (ping)", de.publicKey.ShortString())
+					if len(episodes) != 1 || episodes[0] != wantLog {
+						t.Errorf("episode logs=%q, want one %q", episodes, wantLog)
+					}
+					return
+				}
+				if row == "stale-better-path-after-validation" {
+					time.Sleep(50 * time.Millisecond)
+					recoveryTestPong(t, de, newAddr, now, 0)
+					// A loopback candidate wins betterAddr even with a slightly older ping.
+					oldAddr = netip.MustParseAddrPort("127.0.0.1:9")
+					de.endpointState[oldAddr] = &endpointState{}
+					if !betterAddr(addrQuality{epAddr: epAddr{ap: oldAddr}, latency: mono.Now().Sub(staleAt)}, de.bestAddr) {
+						t.Fatal("fixture's stale pong would not win betterAddr")
+					}
+				}
+				best, bestAt, trust, callbacks := de.bestAddr, de.bestAddrAt, de.trustBestAddrUntil, len(validated)
+				recoveryTestPong(t, de, oldAddr, staleAt, 0)
+				if de.bestAddr != best || de.bestAddrAt != bestAt || de.trustBestAddrUntil != trust || len(validated) != callbacks {
+					t.Errorf("stale pong changed best=%v bestAt=%v trust=%v callbacks=%d", de.bestAddr, de.bestAddrAt, de.trustBestAddrUntil, len(validated))
+				}
+				if len(de.endpointState[oldAddr].recentPongs) != 1 {
+					t.Error("stale pong was not recorded in endpoint history")
+				}
+				if de.freshAfter != now {
+					t.Errorf("episode boundary=%v, want %v", de.freshAfter, now)
+				}
+			})
+		})
+	}
+	for _, source := range []string{"netmap", "callmemaybe-only"} {
+		for _, enabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("callmemaybe-omits-%s-best/enabled=%t", source, enabled), func(t *testing.T) {
+				recoverySynctest(t, func(t *testing.T) {
+					_, de, _ := recoveryTestEndpoint(t, enabled)
+					best, trust := de.bestAddr, de.trustBestAddrUntil
+					de.handleCallMeMaybe(&disco.CallMeMaybe{MyNumber: []netip.AddrPort{best.ap}})
+					synctest.Wait()
+					if source == "callmemaybe-only" {
+						de.mu.Lock()
+						de.setEndpointsLocked(views.SliceOf([]netip.AddrPort{}))
+						de.mu.Unlock()
+						if de.bestAddr != best || de.endpointState[best.ap] == nil {
+							t.Fatal("setup did not retain the CallMeMaybe-only best")
+						}
+					}
+					time.Sleep(time.Millisecond)
+					now := mono.Now()
+					de.handleCallMeMaybe(&disco.CallMeMaybe{})
+					synctest.Wait()
+					st, exists := de.endpointState[best.ap]
+					if enabled {
+						if de.bestAddr != best || de.trustBestAddrUntil != trust || !exists {
+							t.Fatalf("omission: best=%v trust=%v entry=%t, want %v, %v, true", de.bestAddr, de.trustBestAddrUntil, exists, best, trust)
+						}
+						if _, marked := de.isCallMeMaybeEP[best.ap]; marked || !st.callMeMaybeTime.IsZero() || st.lastPing != now {
+							t.Errorf("kept entry: map mark=%t callMeMaybeTime=%v lastPing=%v, want false, zero, %v", marked, st.callMeMaybeTime, st.lastPing, now)
+						}
+						if source == "callmemaybe-only" {
+							de.addCandidateEndpoint(newAddr, stun.NewTxID())
+							de.mu.Lock()
+							de.lastSendData, de.lastSendExt = now, now
+							de.mu.Unlock()
+							de.heartbeat()
+							time.Sleep(directPathHeartbeatInterval)
+							synctest.Wait()
+							de.mu.Lock()
+							st := de.endpointState[best.ap]
+							retained := st != nil && st.lastPing == mono.Now() && de.bestAddr == best
+							de.mu.Unlock()
+							if !retained {
+								t.Fatal("episode retry did not retain and ping the omitted best")
+							}
+							time.Sleep(pingTimeoutDuration - directPathHeartbeatInterval)
+							synctest.Wait()
+							de.mu.Lock()
+							cleared := !de.bestAddr.ap.IsValid()
+							de.mu.Unlock()
+							if !cleared {
+								t.Fatal("upstream ping timeout retained the untrusted best")
+							}
+							de.mu.Lock()
+							de.sendDiscoPingsLocked(mono.Now(), false)
+							pruned := de.endpointState[best.ap] == nil
+							de.mu.Unlock()
+							if !pruned {
+								t.Error("next prune kept the cleared best's entry")
+							}
+						}
+					} else if exists || de.bestAddr.ap.IsValid() {
+						t.Errorf("option off: entry=%t best=%v, want deleted and cleared", exists, de.bestAddr)
+					}
+				})
+			})
+		}
+	}
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("netmap-removes-best/enabled=%t", enabled), func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				_, de, _ := recoveryTestEndpoint(t, enabled)
+				best := de.bestAddr
+				de.mu.Lock()
+				de.setEndpointsLocked(views.SliceOf([]netip.AddrPort{}))
+				_, exists := de.endpointState[best.ap]
+				got := de.bestAddr
+				de.mu.Unlock()
+				if enabled && (got != best || !exists) {
+					t.Errorf("option on: best=%v entry=%t, want %v retained", got, exists, best)
+				}
+				if !enabled && (exists || got.ap.IsValid()) {
+					t.Errorf("option off: best=%v entry=%t, want deleted and cleared", got, exists)
+				}
+			})
+		})
+	}
+}
+
+func TestDirectPathRecoveryAnnouncesEndpoints(t *testing.T) {
+	for _, row := range []string{"changed", "unchanged", "option-off", "no-recipients"} {
+		t.Run(row, func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				c := newPacketListenerTestConn(t, Options{DirectPathRecovery: row != "option-off"})
+				writes := captureDERPDataWrites(c)
+				var logs []string
+				c.logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+				peers := make(map[key.NodePublic]key.DiscoPrivate)
+				want := make(map[key.NodePublic]bool)
+				for i, kind := range []string{"data-active", "idle", "new-episode", "old-episode", "no-derp"} {
+					dk := key.NewDisco()
+					node := (&tailcfg.Node{ID: tailcfg.NodeID(i + 1), Key: key.NewNode().Public(), DiscoKey: dk.Public(), HomeDERP: 1}).View()
+					c.mu.Lock()
+					c.upsertPeerLocked(node, debugFlags{}, 1)
+					de, _ := c.peerMap.endpointForNodeKey(node.Key())
+					c.mu.Unlock()
+					de.mu.Lock()
+					switch kind {
+					case "data-active", "no-derp":
+						de.lastSendData = mono.Now()
+					case "new-episode":
+						de.freshAfter = mono.Now().Add(-time.Second)
+					case "old-episode":
+						de.freshAfter = mono.Now().Add(-5 * time.Second)
+					}
+					if kind == "no-derp" || row == "no-recipients" {
+						de.derpAddr = netip.AddrPort{}
+					}
+					de.mu.Unlock()
+					peers[node.Key()] = dk
+					if row == "changed" && (kind == "data-active" || kind == "new-episode") {
+						want[node.Key()] = true
+					}
+				}
+				endpoints := orderedTestEndpoints(3)
+				c.epFunc = func(got []tailcfg.Endpoint) {
+					if !slices.Equal(got, endpoints) {
+						t.Errorf("endpoint callback = %v, want %v", got, endpoints)
+					}
+				}
+				if row == "unchanged" {
+					c.setEndpoints(endpoints)
+				}
+				c.setEndpointsAndNotify(endpoints)
+				synctest.Wait()
+				got := make(map[key.NodePublic]int)
+				for len(writes) > 0 {
+					wr := <-writes
+					got[wr.pubKey]++
+					shared := peers[wr.pubKey].Shared(c.discoAtomic.Public())
+					plain, ok := shared.Open(wr.b[len(disco.Magic)+32:])
+					if !ok {
+						t.Fatal("cannot open announcement")
+					}
+					msg, err := disco.Parse(plain)
+					if err != nil {
+						t.Fatal(err)
+					}
+					cmm, ok := msg.(*disco.CallMeMaybe)
+					if !ok {
+						t.Fatalf("announcement=%T, want CallMeMaybe", msg)
+					}
+					if !slices.Equal(cmm.MyNumber, epFromTyped(endpoints)) {
+						t.Errorf("announced endpoints=%v, want %v", cmm.MyNumber, epFromTyped(endpoints))
+					}
+				}
+				if len(got) != len(want) {
+					t.Errorf("announcement recipients=%v, want %v", got, want)
+				}
+				for peer := range want {
+					if got[peer] != 1 {
+						t.Errorf("announcements to %v = %d, want 1", peer, got[peer])
+					}
+				}
+				wantLog := ""
+				if row == "changed" || row == "no-recipients" {
+					wantLog = fmt.Sprintf("magicsock: announcing new endpoints to %d active peers", len(want))
+				}
+				var announcements []string
+				for _, line := range logs {
+					if strings.Contains(line, "announcing new endpoints") {
+						announcements = append(announcements, line)
+					}
+				}
+				if wantLog != "" && (len(announcements) != 1 || announcements[0] != wantLog) || wantLog == "" && len(announcements) != 0 {
+					t.Errorf("announcement logs=%q, want %q", announcements, wantLog)
+				}
+			})
+		})
+	}
+}
+
+type recoveryLivenessState struct {
+	bestAddr                                                        addrQuality
+	lastSendData, freshAfter, trustBestAddrUntil, firstUnansweredAt mono.Time
+	heartBeatTimer                                                  *time.Timer
+	lastPing                                                        map[netip.AddrPort]mono.Time
+}
+
+func recoveryTestLivenessState(de *endpoint) recoveryLivenessState {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	state := recoveryLivenessState{
+		bestAddr:           de.bestAddr,
+		lastSendData:       de.lastSendData,
+		freshAfter:         de.freshAfter,
+		trustBestAddrUntil: de.trustBestAddrUntil,
+		firstUnansweredAt:  de.firstUnansweredAt,
+		heartBeatTimer:     de.heartBeatTimer,
+		lastPing:           make(map[netip.AddrPort]mono.Time, len(de.endpointState)),
+	}
+	for addr, st := range de.endpointState {
+		state.lastPing[addr] = st.lastPing
+	}
+	return state
+}
+
+func TestDirectPathRecoveryLiveness(t *testing.T) {
+	recoveryTestTimeouts(t)
+	for _, latency := range []time.Duration{350 * time.Millisecond, 500 * time.Millisecond, 525 * time.Millisecond} {
+		t.Run(fmt.Sprintf("data-active-latency=%v", latency), func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				c, de, _ := recoveryTestEndpoint(t, true)
+				de.bestAddr.latency = latency
+				other := netip.MustParseAddrPort("192.0.2.2:5678")
+				de.endpointState[other] = &endpointState{index: 1, lastPing: mono.Now()}
+				start, best := mono.Now(), de.bestAddr
+				if err := de.send([][]byte{make([]byte, packet.GeneveFixedHeaderLength+4)}, packet.GeneveFixedHeaderLength); err != nil {
+					t.Fatal(err)
+				}
+				if state := recoveryTestLivenessState(de); state.lastSendData != start {
+					t.Errorf("lastSendData=%v, want %v", state.lastSendData, start)
+				}
+				time.Sleep(500 * time.Millisecond)
+				synctest.Wait()
+				if state := recoveryTestLivenessState(de); state.lastPing[best.ap] != mono.Now() {
+					t.Errorf("first heartbeat lastPing=%v, want %v", state.lastPing[best.ap], mono.Now())
+				}
+				first := start.Add(500 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
+				synctest.Wait()
+				if state := recoveryTestLivenessState(de); state.lastPing[best.ap] != mono.Now() || state.firstUnansweredAt != first {
+					t.Errorf("second beat lastPing=%v firstUnansweredAt=%v, want %v and %v", state.lastPing[best.ap], state.firstUnansweredAt, mono.Now(), first)
+				}
+				deadline := first.Add(max(time.Second, 3*latency))
+				time.Sleep(deadline.Sub(mono.Now()) - time.Nanosecond)
+				synctest.Wait()
+				if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "" || state.freshAfter != 0 {
+					t.Errorf("loss before L: ReSTUN=%q freshAfter=%v", why, state.freshAfter)
+				}
+				time.Sleep(time.Nanosecond)
+				synctest.Wait()
+				if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "direct-path-lost" || state.freshAfter != deadline || state.trustBestAddrUntil != deadline || state.bestAddr != best || !state.firstUnansweredAt.IsZero() {
+					t.Errorf("at L: ReSTUN=%q freshAfter=%v trust=%v best=%v firstUnanswered=%v", why, state.freshAfter, state.trustBestAddrUntil, state.bestAddr, state.firstUnansweredAt)
+				}
+				for addr, lastPing := range recoveryTestLivenessState(de).lastPing {
+					if lastPing != deadline {
+						t.Errorf("candidate %v lastPing=%v, want %v", addr, lastPing, deadline)
+					}
+				}
+				time.Sleep(2 * time.Second)
+				synctest.Wait()
+				if state := recoveryTestLivenessState(de); state.freshAfter != deadline {
+					t.Errorf("untrusted endpoint opened a second B episode at %v", state.freshAfter)
+				}
+			})
+		})
+	}
+	for _, row := range []string{"idle", "idle-open-episode", "option-off", "already-untrusted"} {
+		t.Run(row, func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				c, de, _ := recoveryTestEndpoint(t, row != "option-off")
+				start := mono.Now()
+				de.lastSendExt = start
+				if row == "option-off" || row == "already-untrusted" {
+					de.lastSendData = start
+				}
+				if row == "idle-open-episode" {
+					de.freshAfter = start
+					de.trustBestAddrUntil = start
+				}
+				if row == "already-untrusted" {
+					de.trustBestAddrUntil = start
+				}
+				de.heartbeat()
+				synctest.Wait()
+				fresh := recoveryTestLivenessState(de).freshAfter
+				if row != "already-untrusted" {
+					time.Sleep(3*time.Second - time.Nanosecond)
+					synctest.Wait()
+					if state := recoveryTestLivenessState(de); state.lastPing[state.bestAddr.ap] != start {
+						t.Errorf("idle or option-off heartbeat fired before 3s: %v", state.lastPing[state.bestAddr.ap])
+					}
+					time.Sleep(time.Nanosecond)
+					synctest.Wait()
+					if state := recoveryTestLivenessState(de); state.lastPing[state.bestAddr.ap] != mono.Now() {
+						t.Errorf("heartbeat did not fire at 3s: %v", state.lastPing[state.bestAddr.ap])
+					}
+				} else {
+					time.Sleep(2 * time.Second)
+					synctest.Wait()
+				}
+				if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "" || state.freshAfter != fresh || !state.firstUnansweredAt.IsZero() {
+					t.Errorf("unexpected B: ReSTUN=%q freshAfter=%v firstUnanswered=%v", why, state.freshAfter, state.firstUnansweredAt)
+				}
+			})
+		})
+	}
+	for _, latency := range []time.Duration{350 * time.Millisecond, 525 * time.Millisecond} {
+		for _, lost := range []bool{false, true} {
+			t.Run(fmt.Sprintf("pong-latency=%v/one-lost=%t", latency, lost), func(t *testing.T) {
+				recoverySynctest(t, func(t *testing.T) {
+					c, de, _ := recoveryTestEndpoint(t, true)
+					de.bestAddr.latency = latency
+					de.lastSendData, de.lastSendExt = mono.Now(), mono.Now()
+					start := mono.Now()
+					de.heartbeat()
+					if lost {
+						time.Sleep(500 * time.Millisecond)
+					}
+					at := mono.Now()
+					time.Sleep(latency)
+					recoveryTestPong(t, de, recoveryTestLivenessState(de).bestAddr.ap, at, 0)
+					if state := recoveryTestLivenessState(de); !state.firstUnansweredAt.IsZero() {
+						t.Errorf("pong did not clear unanswered ping: %v", state.firstUnansweredAt)
+					}
+					// Stop automatic beats to isolate the timer the answered ping armed.
+					recoveryTestLivenessState(de).heartBeatTimer.Stop()
+					time.Sleep(start.Add(3*latency).Sub(mono.Now()) + time.Nanosecond)
+					synctest.Wait()
+					if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "" || state.freshAfter != 0 {
+						t.Errorf("answered heartbeat caused B: ReSTUN=%q freshAfter=%v", why, state.freshAfter)
+					}
+				})
+			})
+		}
+	}
+	t.Run("late-earlier-pong-then-unanswered", func(t *testing.T) {
+		recoverySynctest(t, func(t *testing.T) {
+			c, de, _ := recoveryTestEndpoint(t, true)
+			de.bestAddr.latency = 350 * time.Millisecond
+			de.lastSendData = mono.Now()
+			start := mono.Now()
+			de.mu.Lock()
+			de.startDiscoPingLocked(de.bestAddr.epAddr, start, pingCLI, 0, nil)
+			de.mu.Unlock()
+			time.Sleep(350 * time.Millisecond)
+			recoveryTestPong(t, de, recoveryTestLivenessState(de).bestAddr.ap, start.Add(-time.Millisecond), 0)
+			de.mu.Lock()
+			de.startDiscoPingLocked(de.bestAddr.epAddr, mono.Now(), pingHeartbeat, 0, nil)
+			de.mu.Unlock()
+			deadline := mono.Now().Add(3 * recoveryTestLivenessState(de).bestAddr.latency)
+			if state := recoveryTestLivenessState(de); state.heartBeatTimer != nil {
+				state.heartBeatTimer.Stop()
+			}
+			time.Sleep(deadline.Sub(mono.Now()) - time.Nanosecond)
+			synctest.Wait()
+			if why := recoveryTestReSTUN(c); why != "" {
+				t.Errorf("old timer caused loss early: %q", why)
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			if why, state := recoveryTestReSTUN(c), recoveryTestLivenessState(de); why != "direct-path-lost" || state.freshAfter != deadline {
+				t.Errorf("new unanswered ping: ReSTUN=%q freshAfter=%v, want direct-path-lost and %v", why, state.freshAfter, deadline)
+			}
+		})
+	})
+	t.Run("episode-retry", func(t *testing.T) {
+		recoverySynctest(t, func(t *testing.T) {
+			_, de, _ := recoveryTestEndpoint(t, true)
+			other := netip.MustParseAddrPort("192.0.2.2:5678")
+			de.addCandidateEndpoint(other, stun.NewTxID())
+			start := mono.Now()
+			de.lastSendData, de.lastSendExt = start, start
+			de.heartbeat()
+			for i := 1; i < 10; i++ {
+				time.Sleep(500 * time.Millisecond)
+				synctest.Wait()
+				if state := recoveryTestLivenessState(de); state.lastPing[other] != mono.Now() {
+					t.Errorf("beat %d candidate lastPing=%v, want %v", i, state.lastPing[other], mono.Now())
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			if state := recoveryTestLivenessState(de); state.lastPing[other] != start.Add(4500*time.Millisecond) {
+				t.Errorf("candidate limit bypassed after 5s: lastPing=%v", state.lastPing[other])
+			}
+			recoveryTestLivenessState(de).heartBeatTimer.Stop()
+			de.heartBeatTimer = nil
+			if state := recoveryTestLivenessState(de); state.bestAddr.ap.IsValid() {
+				t.Errorf("ping timeout retained the untrusted dead best address %v", state.bestAddr)
+			}
+			recoveryTestPong(t, de, other, mono.Now().Add(-time.Millisecond), 0)
+			// Episode alone uses the normal cadence; a new data send restarts fast beats.
+			if err := de.send([][]byte{make([]byte, packet.GeneveFixedHeaderLength+4)}, packet.GeneveFixedHeaderLength); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			if state := recoveryTestLivenessState(de); state.heartBeatTimer == nil {
+				t.Error("data after idle did not restart heartbeats")
+			}
+			if state := recoveryTestLivenessState(de); state.lastPing[other] != mono.Now() {
+				t.Errorf("data after idle: heartbeat at %v, want %v", state.lastPing[other], mono.Now())
+			}
+		})
+	})
+	for _, timerState := range []string{"absent", "armed", "stopped", "disabled"} {
+		t.Run("first-data-heartbeat/"+timerState, func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				_, de, _ := recoveryTestEndpoint(t, true)
+				start := mono.Now()
+				de.lastSendData = start.Add(-5 * time.Second)
+				switch timerState {
+				case "armed", "stopped":
+					de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
+					if timerState == "stopped" {
+						recoveryTestLivenessState(de).heartBeatTimer.Stop()
+					}
+				case "disabled":
+					de.heartbeatDisabled = true
+				}
+				if err := de.send([][]byte{make([]byte, packet.GeneveFixedHeaderLength+4)}, packet.GeneveFixedHeaderLength); err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(500 * time.Millisecond)
+				synctest.Wait()
+				want := mono.Now()
+				if timerState == "disabled" {
+					want = start
+				}
+				state := recoveryTestLivenessState(de)
+				if got := state.lastPing[state.bestAddr.ap]; got != want {
+					t.Errorf("first data heartbeat at %v, want %v", got, want)
+				}
+			})
+		})
+	}
+	for _, reset := range []string{"resetLocked", "stopAndReset"} {
+		t.Run("liveness-timer/"+reset, func(t *testing.T) {
+			recoverySynctest(t, func(t *testing.T) {
+				c, de, _ := recoveryTestEndpoint(t, true)
+				de.lastSendData = mono.Now()
+				de.mu.Lock()
+				de.startDiscoPingLocked(de.bestAddr.epAddr, mono.Now(), pingHeartbeat, 0, nil)
+				timer := de.livenessTimer
+				de.mu.Unlock()
+				if timer == nil {
+					t.Fatal("trusted active ping did not arm liveness")
+				}
+				if reset == "resetLocked" {
+					de.mu.Lock()
+					de.resetLocked()
+					de.mu.Unlock()
+				} else {
+					de.stopAndReset()
+				}
+				if timer.Stop() {
+					t.Error("reset left the liveness timer running")
+				}
+				time.Sleep(time.Second)
+				synctest.Wait()
+				if why := recoveryTestReSTUN(c); why != "" {
+					t.Errorf("reset caused a stale ReSTUN request: %q", why)
+				}
+			})
+		})
+	}
+}
 
 func TestProbeUDPLifetimeConfig_Equals(t *testing.T) {
 	tests := []struct {

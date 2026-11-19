@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/derp/derpserver"
+	"tailscale.com/disco"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netmon"
@@ -144,6 +146,100 @@ func TestRelayedDataAllowedPerPeer(t *testing.T) {
 				}
 			} else if got := c.DERPDataSuppressed(); got != 0 {
 				t.Fatalf("default suppressed = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func orderedTestEndpoints(n int) []tailcfg.Endpoint {
+	eps := make([]tailcfg.Endpoint, n)
+	for i := range eps {
+		addr := netip.MustParseAddr("2001:db8::1")
+		typ := tailcfg.EndpointLocal
+		switch i % 4 {
+		case 1:
+			addr = netip.MustParseAddr("192.0.2.1")
+		case 2:
+			typ = tailcfg.EndpointSTUN
+		case 3:
+			typ = tailcfg.EndpointPortmapped
+		}
+		eps[i] = tailcfg.Endpoint{Addr: netip.AddrPortFrom(addr, uint16(i+1)), Type: typ}
+	}
+	return eps
+}
+
+func TestCapEndpointsOrder(t *testing.T) {
+	eps := orderedTestEndpoints(8)
+	eps = append(eps, tailcfg.Endpoint{Addr: netip.MustParseAddrPort("192.0.2.2:9"), Type: tailcfg.EndpointSTUN4LocalPort})
+	want := []tailcfg.Endpoint{eps[2], eps[3], eps[6], eps[7], eps[8], eps[1], eps[5], eps[0], eps[4]}
+	before := slices.Clone(eps)
+	for _, max := range []int{0, 1, 6, 9, 64} {
+		got := CapEndpoints(eps, max)
+		expect := want[:min(max, len(want))]
+		if !slices.Equal(got, expect) {
+			t.Errorf("max=%d: got %v, want %v", max, got, expect)
+		}
+	}
+	if !slices.Equal(eps, before) {
+		t.Fatal("CapEndpoints mutates input")
+	}
+}
+
+func TestCallMeMaybeEndpointCap(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		cap, count, want, size int
+	}{
+		{"default", 0, 80, 80, 1520}, {"capped", 64, 80, 64, 1232}, {"short", 64, 40, 40, 800},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newPacketListenerTestConn(t, Options{MaxCallMeMaybeEndpoints: tc.cap})
+			ch := captureDERPDataWrites(c)
+			peerDisco := key.NewDisco()
+			node := (&tailcfg.Node{ID: 1, Key: key.NewNode().Public(), DiscoKey: peerDisco.Public(), HomeDERP: 1}).View()
+			c.mu.Lock()
+			c.upsertPeerLocked(node, debugFlags{}, 1)
+			de, ok := c.peerMap.endpointForNodeKey(node.Key())
+			c.mu.Unlock()
+			if !ok {
+				t.Fatal("missing peer")
+			}
+			c.lastEndpoints = orderedTestEndpoints(tc.count)
+			c.lastEndpointsTime = time.Now()
+			c.enqueueCallMeMaybe(netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 1), de)
+			select {
+			case wr := <-ch:
+				if len(wr.b) != tc.size {
+					t.Fatalf("body = %d bytes, want %d", len(wr.b), tc.size)
+				}
+				shared := peerDisco.Shared(c.discoAtomic.Public())
+				plain, ok := shared.Open(wr.b[len(disco.Magic)+32:])
+				if !ok {
+					t.Fatal("cannot open CallMeMaybe")
+				}
+				m, err := disco.Parse(plain)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmm, ok := m.(*disco.CallMeMaybe)
+				if !ok {
+					t.Fatalf("message = %T, want CallMeMaybe", m)
+				}
+				if len(cmm.MyNumber) != tc.want {
+					t.Fatalf("endpoints = %d, want %d", len(cmm.MyNumber), tc.want)
+				}
+				wantEndpoints := c.lastEndpoints
+				if tc.cap > 0 {
+					wantEndpoints = CapEndpoints(c.lastEndpoints, tc.cap)
+				}
+				for i, ep := range wantEndpoints {
+					if cmm.MyNumber[i] != ep.Addr {
+						t.Fatalf("endpoint %d = %v, want %v", i, cmm.MyNumber[i], ep.Addr)
+					}
+				}
+			case <-time.After(time.Second):
+				t.Fatal("CallMeMaybe not sent")
 			}
 		})
 	}

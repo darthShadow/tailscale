@@ -185,30 +185,35 @@ func newMagicStack(t testing.TB, logf logger.Logf, ln nettype.PacketListener, de
 }
 
 func newMagicStackWithKey(t testing.TB, logf logger.Logf, ln nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
+	return newMagicStackWithOptions(t, logf, ln, derpMap, privateKey, Options{})
+}
+
+func newMagicStackWithOptions(t testing.TB, logf logger.Logf, ln nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate, opts Options) *magicStack {
 	t.Helper()
 
 	bus := eventbustest.NewBus(t)
 
-	netMon, err := netmon.New(bus, logf)
-	if err != nil {
-		t.Fatalf("netmon.New: %v", err)
+	netMon := opts.NetMon
+	if netMon == nil {
+		var err error
+		netMon, err = netmon.New(bus, logf)
+		if err != nil {
+			t.Fatalf("netmon.New: %v", err)
+		}
 	}
 	ht := health.NewTracker(bus)
 
 	var reg usermetric.Registry
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
-	conn, err := NewConn(Options{
-		NetMon:                 netMon,
-		EventBus:               bus,
-		Metrics:                &reg,
-		Logf:                   logf,
-		HealthTracker:          ht,
-		DisablePortMapper:      true,
-		TestOnlyPacketListener: ln,
-		EndpointsFunc: func(eps []tailcfg.Endpoint) {
-			epCh <- eps
-		},
-	})
+	opts.NetMon = netMon
+	opts.EventBus = bus
+	opts.Metrics = &reg
+	opts.Logf = logf
+	opts.HealthTracker = ht
+	opts.DisablePortMapper = true
+	opts.TestOnlyPacketListener = ln
+	opts.EndpointsFunc = func(eps []tailcfg.Endpoint) { epCh <- eps }
+	conn, err := NewConn(opts)
 	if err != nil {
 		t.Fatalf("constructing magicsock: %v", err)
 	}
@@ -1051,6 +1056,93 @@ func TestActiveDiscovery(t *testing.T) {
 		}
 		testActiveDiscovery(t, n)
 	})
+}
+
+func TestDirectPathRecoverySilentRemap(t *testing.T) {
+	mstun := &natlab.Machine{Name: "stun"}
+	m1 := &natlab.Machine{Name: "m1", PacketHandler: &natlab.Firewall{}}
+	m2 := &natlab.Machine{Name: "m2", PacketHandler: &natlab.Firewall{}}
+	nat1, nat2 := &natlab.Machine{Name: "nat1"}, &natlab.Machine{Name: "nat2"}
+	inet := natlab.NewInternet()
+	lan1 := &natlab.Network{Name: "lan1", Prefix4: netip.MustParsePrefix("192.168.0.0/24")}
+	lan2 := &natlab.Network{Name: "lan2", Prefix4: netip.MustParsePrefix("192.168.1.0/24")}
+	sif := mstun.Attach("eth0", inet)
+	nat1WAN, nat1LAN := nat1.Attach("wan", inet), nat1.Attach("lan", lan1)
+	nat2WAN, nat2LAN := nat2.Attach("wan", inet), nat2.Attach("lan", lan2)
+	m1.Attach("eth0", lan1)
+	m2.Attach("eth0", lan2)
+	lan1.SetDefaultGateway(nat1LAN)
+	lan2.SetDefaultGateway(nat2LAN)
+	var clockOffset atomic.Int64
+	nat1.PacketHandler = &natlab.SNAT44{
+		Machine: nat1, ExternalInterface: nat1WAN, MappingTimeout: time.Hour,
+		TimeNow:  func() time.Time { return time.Now().Add(time.Duration(clockOffset.Load())) },
+		Firewall: &natlab.Firewall{TrustedInterface: nat1LAN},
+	}
+	nat2.PacketHandler = &natlab.SNAT44{
+		Machine: nat2, ExternalInterface: nat2WAN,
+		Firewall: &natlab.Firewall{TrustedInterface: nat2LAN},
+	}
+	logf, closeLogf := logger.LogfCloser(t.Logf)
+	defer closeLogf()
+	derpMap, closeDERP := runDERPAndStun(t, logf, mstun, sif.V4())
+	defer closeDERP()
+	s1 := newMagicStackWithOptions(t, logf, m1, derpMap, key.NewNode(), Options{DirectPathRecovery: true, NetMon: netmon.NewStatic()})
+	defer s1.Close()
+	s2 := newMagicStackWithOptions(t, logf, m2, derpMap, key.NewNode(), Options{DirectPathRecovery: true, NetMon: netmon.NewStatic()})
+	defer s2.Close()
+	stopMesh := meshStacks(logf, nil, s1, s2)
+	meshStopped := false
+	defer func() {
+		if !meshStopped {
+			stopMesh()
+		}
+	}()
+	stopPinger := newPinger(t, logf, s1, s2)
+	mustDirect(t, logf, s1, s2)
+	mustDirect(t, logf, s2, s1)
+	stopPinger()
+	oldAddr := s2.Status().Peer[s1.Public()].CurAddr
+	if oldAddr == "" {
+		t.Fatal("setup has no trusted direct path")
+	}
+	// Freeze both network maps before expiring m1's NAT sessions.
+	stopMesh()
+	meshStopped = true
+	s1.conn.mu.Lock()
+	de, ok := s1.conn.peerMap.endpointForNodeKey(s2.Public())
+	s1.conn.mu.Unlock()
+	if !ok {
+		t.Fatal("missing m2 endpoint")
+	}
+	clockOffset.Store(int64(2 * time.Hour))
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// Use the data send path throughout the outage, without engine pings,
+		// Rebind, ReSTUN, or a network-map update from the test.
+		if err := de.send([][]byte{make([]byte, packet.GeneveFixedHeaderLength+32)}, packet.GeneveFixedHeaderLength); err != nil {
+			t.Fatal(err)
+		}
+		cur := s2.Status().Peer[s1.Public()].CurAddr
+		if cur != "" && cur != oldAddr {
+			ap, err := netip.ParseAddrPort(cur)
+			if err != nil || ap.Addr() != nat1WAN.V4() {
+				t.Fatalf("recovered address=%q, want m1's WAN %v: %v", cur, nat1WAN.V4(), err)
+			}
+			s1.conn.mu.Lock()
+			advertised := slices.ContainsFunc(s1.conn.lastEndpoints, func(ep tailcfg.Endpoint) bool {
+				return ep.Type == tailcfg.EndpointSTUN && ep.Addr == ap
+			})
+			s1.conn.mu.Unlock()
+			if !advertised {
+				t.Fatalf("recovered address %v is not m1's new STUN endpoint", ap)
+			}
+			t.Logf("silent remap recovered %s -> %s within 5s with network maps held", oldAddr, cur)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("new NAT port not learned within 5s: old=%s current=%s", oldAddr, s2.Status().Peer[s1.Public()].CurAddr)
 }
 
 type devices struct {

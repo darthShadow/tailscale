@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
@@ -156,9 +157,13 @@ type metrics struct {
 
 // A Conn routes UDP packets and actively manages a list of its endpoints.
 type Conn struct {
-	relayedDataAllowed func(peer key.NodePublic) bool
-	derpDataSuppressed atomic.Int64
-	signalingRegions   map[int]SignalingRegion
+	relayedDataAllowed      func(peer key.NodePublic) bool
+	derpDataSuppressed      atomic.Int64
+	quicDontFragment        func(string, string, syscall.RawConn) error
+	signalingRegions        map[int]SignalingRegion
+	maxCallMeMaybeEndpoints int
+	directPathRecovery      bool
+	directPathValidatedFunc func(peer key.NodePublic)
 
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
@@ -456,10 +461,28 @@ type Options struct {
 	// independently. The callback must be safe for concurrent calls.
 	RelayedDataAllowed func(peer key.NodePublic) bool
 
+	// QUICDontFragment sets DF before each UDP socket is exposed, including
+	// rebinds. It must return an error if fragmentation cannot be disabled.
+	// A nil callback preserves upstream socket creation.
+	QUICDontFragment func(network, address string, raw syscall.RawConn) error
+
 	// SignalingRegions supplies optional DERP stream dials by region ID.
 	// Each region still needs a DERP map node to supply the dial URL.
 	// Configure the map before NewConn and do not mutate it afterward.
 	SignalingRegions map[int]SignalingRegion
+
+	// MaxCallMeMaybeEndpoints caps advertised endpoints when positive.
+	// Zero preserves upstream's uncapped endpoint order.
+	MaxCallMeMaybeEndpoints int
+
+	// DirectPathRecovery enables prompt revalidation after endpoint changes
+	// and liveness loss. False preserves upstream path discovery.
+	DirectPathRecovery bool
+
+	// DirectPathValidatedFunc runs asynchronously when a fresh direct pong
+	// changes a peer's path from untrusted to trusted. It must be safe for
+	// concurrent calls. Nil disables the notification.
+	DirectPathValidatedFunc func(peer key.NodePublic)
 
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
@@ -653,7 +676,11 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c := newConn(opts.logf())
 	c.relayedDataAllowed = opts.RelayedDataAllowed
+	c.quicDontFragment = opts.QUICDontFragment
 	c.signalingRegions = opts.SignalingRegions
+	c.maxCallMeMaybeEndpoints = opts.MaxCallMeMaybeEndpoints
+	c.directPathRecovery = opts.DirectPathRecovery
+	c.directPathValidatedFunc = opts.DirectPathValidatedFunc
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}
@@ -958,9 +985,36 @@ func (c *Conn) updateEndpoints(why string) {
 		return
 	}
 
+	c.setEndpointsAndNotify(endpoints)
+}
+
+func (c *Conn) setEndpointsAndNotify(endpoints []tailcfg.Endpoint) {
 	if c.setEndpoints(endpoints) {
 		c.logEndpointChange(endpoints)
 		c.epFunc(endpoints)
+		if c.directPathRecovery {
+			var peers []struct {
+				de       *endpoint
+				derpAddr netip.AddrPort
+			}
+			now := mono.Now()
+			c.mu.Lock()
+			c.peerMap.forEachEndpoint(func(de *endpoint) {
+				de.mu.Lock()
+				defer de.mu.Unlock()
+				if de.derpAddr.IsValid() && (de.dataActiveLocked(now) || de.recoveryEpisodeRetryLocked(now)) {
+					peers = append(peers, struct {
+						de       *endpoint
+						derpAddr netip.AddrPort
+					}{de, de.derpAddr})
+				}
+			})
+			c.mu.Unlock()
+			c.logf("magicsock: announcing new endpoints to %d active peers", len(peers))
+			for _, peer := range peers {
+				c.enqueueCallMeMaybe(peer.derpAddr, peer.de)
+			}
+		}
 	}
 }
 
@@ -2718,8 +2772,12 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 		return
 	}
 
-	eps := make([]netip.AddrPort, 0, len(c.lastEndpoints))
-	for _, ep := range c.lastEndpoints {
+	endpoints := c.lastEndpoints
+	if c.maxCallMeMaybeEndpoints > 0 {
+		endpoints = CapEndpoints(endpoints, c.maxCallMeMaybeEndpoints)
+	}
+	eps := make([]netip.AddrPort, 0, len(endpoints))
+	for _, ep := range endpoints {
 		eps = append(eps, ep.Addr)
 	}
 	go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, de.publicKey, epDisco.key(), &disco.CallMeMaybe{MyNumber: eps}, discoLog)
@@ -3763,9 +3821,24 @@ func (c *Conn) listenPacket(network string, port uint16) (nettype.PacketConn, er
 	}
 	addr := net.JoinHostPort("", fmt.Sprint(port))
 	if c.testOnlyPacketListener != nil {
+		if c.quicDontFragment != nil {
+			return nil, errors.New("QUIC DF control requires the UDP listener")
+		}
 		return nettype.MakePacketListenerWithNetIP(c.testOnlyPacketListener).ListenPacket(ctx, network, addr)
 	}
-	return nettype.MakePacketListenerWithNetIP(netns.Listener(c.logf, c.netMon)).ListenPacket(ctx, network, addr)
+	listener := netns.Listener(c.logf, c.netMon)
+	if c.quicDontFragment != nil {
+		previous := listener.Control
+		listener.Control = func(network, address string, raw syscall.RawConn) error {
+			if previous != nil {
+				if err := previous(network, address, raw); err != nil {
+					return err
+				}
+			}
+			return c.quicDontFragment(network, address, raw)
+		}
+	}
+	return nettype.MakePacketListenerWithNetIP(listener).ListenPacket(ctx, network, addr)
 }
 
 // bindSocket binds a UDP socket to ruc.
