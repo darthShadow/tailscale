@@ -1,0 +1,52 @@
+# CI for the shunpike patches on this fork. Upstream's workflows are disabled
+# here; this one tests what the fork adds and what shunpike needs from it.
+name: Fork CI
+
+on:
+  push:
+    branches-ignore: [upstream-main]
+    tags: ["v*-shunpike.*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOWORK: "off"
+
+jobs:
+  patched-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      # Upstream vets with its own analyzer set (cmd/vet), not the default one.
+      - run: go build -o "$RUNNER_TEMP/vettool" tailscale.com/cmd/vet
+      - run: go vet -vettool="$RUNNER_TEMP/vettool" ./derp/... ./wgengine/magicsock/...
+      - run: go test -race -timeout 20m ./derp/... ./wgengine/magicsock/...
+
+  shunpike:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: darthShadow/shunpike
+          ref: main
+          path: shunpike
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: shunpike/go.mod
+      - name: Point shunpike at this commit
+        working-directory: shunpike
+        run: go mod edit -replace tailscale.com=../fork && go mod tidy
+      - working-directory: shunpike
+        run: go test -race ./...
