@@ -56,6 +56,13 @@ import (
 // Send/Recv will completely re-establish the connection (unless Close
 // has been called).
 type Client struct {
+	// StreamDial, when non-nil, supplies a stream that speaks DERP from its
+	// first byte. It owns any transport authentication and HTTP upgrade.
+	// Set it before first use. It is called on every new connection and must
+	// honor ctx. A dial error fails that connection attempt. The client owns
+	// each returned stream and closes it on handshake failure or Close.
+	StreamDial func(ctx context.Context, url string) (net.Conn, error)
+
 	TLSConfig     *tls.Config        // optional; nil means default
 	HealthTracker *health.Tracker    // optional; used if non-nil only
 	DNSCache      *dnscache.Resolver // optional; nil means no caching
@@ -397,18 +404,31 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	var node *tailcfg.DERPNode // nil when using c.url to dial
 	var idealNodeInRegion bool
 	switch {
-	case canWebsockets && useWebsockets():
+	case c.StreamDial != nil || (canWebsockets && useWebsockets()):
 		var urlStr string
 		if c.url != nil {
 			urlStr = c.url.String()
 		} else {
+			if len(reg.Nodes) == 0 {
+				return nil, 0, fmt.Errorf("no nodes for %s", c.targetString(reg))
+			}
 			urlStr = c.urlString(reg.Nodes[0])
 		}
-		c.logf("%s: connecting websocket to %v", caller, urlStr)
-		conn, err := dialWebsocketFunc(ctx, urlStr)
+		dial := dialWebsocketFunc
+		transport := "websocket"
+		if c.StreamDial != nil {
+			dial = c.StreamDial
+			transport = "stream"
+		}
+		c.logf("%s: connecting %s to %v", caller, transport, urlStr)
+		conn, err := dial(ctx, urlStr)
 		if err != nil {
-			c.logf("%s: websocket to %v error: %v", caller, urlStr, err)
+			c.logf("%s: %s to %v error: %v", caller, transport, urlStr, err)
 			return nil, 0, err
+		}
+		if c.StreamDial != nil {
+			tcpConn = conn
+			defer closeConnOnContext(ctx, conn)()
 		}
 		brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 		derpClient, err := derp.NewClient(c.privateKey, conn, brw, c.logf,
@@ -430,6 +450,10 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		c.client = derpClient
 		c.netConn = conn
 		c.connGen++
+		if c.StreamDial != nil {
+			localAddr, _ := derpClient.LocalAddr()
+			c.atomicState.Store(ConnectedState{Connected: true, LocalAddr: localAddr})
+		}
 		return c.client, c.connGen, nil
 	case c.url != nil:
 		c.logf("%s: connecting to %v", caller, c.url)
@@ -445,27 +469,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 
 	// Now that we have a TCP connection, force close it if the
 	// TLS handshake + DERP setup takes too long.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-done:
-			// Normal path. Upgrade occurred in time.
-		case <-ctx.Done():
-			select {
-			case <-done:
-				// Normal path. Upgrade occurred in time.
-				// But the ctx.Done() is also done because
-				// the "defer cancel()" above scheduled
-				// before this goroutine.
-			default:
-				// The TLS or HTTP or DERP exchanges didn't complete
-				// in time. Force close the TCP connection to force
-				// them to fail quickly.
-				tcpConn.Close()
-			}
-		}
-	}()
+	defer closeConnOnContext(ctx, tcpConn)()
 
 	var httpConn net.Conn        // a TCP conn or a TLS conn; what we speak HTTP to
 	var serverPub key.NodePublic // or zero if unknown (if not using TLS or TLS middlebox eats it)
@@ -592,6 +596,24 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		LocalAddr: localAddr,
 	})
 	return c.client, c.connGen, nil
+}
+
+// closeConnOnContext interrupts a stalled handshake. The returned function
+// stops the watchdog before the successful connection outlives ctx.
+func closeConnOnContext(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			select {
+			case <-done:
+			default:
+				conn.Close()
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 // SetURLDialer sets the dialer to use for dialing URLs.
