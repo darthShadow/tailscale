@@ -1793,8 +1793,8 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
 	return false, errDropDerpPacket
 }
 
-func (c *Conn) receiveIPv4() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn4, c.health.ReceiveFuncStats(health.ReceiveIPv4),
+func (c *Conn) receiveIPv4(lifetime *udpReceiveLifetime) conn.ReceiveFunc {
+	return c.mkReceiveFunc(&c.pconn4, lifetime, c.health.ReceiveFuncStats(health.ReceiveIPv4),
 		&c.metrics.inboundPacketsIPv4Total,
 		&c.metrics.inboundPacketsPeerRelayIPv4Total,
 		&c.metrics.inboundBytesIPv4Total,
@@ -1803,8 +1803,8 @@ func (c *Conn) receiveIPv4() conn.ReceiveFunc {
 }
 
 // receiveIPv6 creates an IPv6 ReceiveFunc reading from c.pconn6.
-func (c *Conn) receiveIPv6() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn6, c.health.ReceiveFuncStats(health.ReceiveIPv6),
+func (c *Conn) receiveIPv6(lifetime *udpReceiveLifetime) conn.ReceiveFunc {
+	return c.mkReceiveFunc(&c.pconn6, lifetime, c.health.ReceiveFuncStats(health.ReceiveIPv6),
 		&c.metrics.inboundPacketsIPv6Total,
 		&c.metrics.inboundPacketsPeerRelayIPv6Total,
 		&c.metrics.inboundBytesIPv6Total,
@@ -1814,7 +1814,7 @@ func (c *Conn) receiveIPv6() conn.ReceiveFunc {
 
 // mkReceiveFunc creates a ReceiveFunc reading from ruc.
 // The provided healthItem and metrics are updated if non-nil.
-func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFuncStats, directPacketMetric, peerRelayPacketMetric, directBytesMetric, peerRelayBytesMetric *expvar.Int) conn.ReceiveFunc {
+func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, lifetime *udpReceiveLifetime, healthItem *health.ReceiveFuncStats, directPacketMetric, peerRelayPacketMetric, directBytesMetric, peerRelayBytesMetric *expvar.Int) conn.ReceiveFunc {
 	// epCache caches an epAddr->endpoint for hot flows.
 	var epCache epAddrEndpointCache
 	var batchingPackets []batching.ReceivedPacket
@@ -1837,7 +1837,7 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 		}
 
 		for {
-			numMsgs, err := ruc.ReadBatch(slab, batchingPackets)
+			numMsgs, err := ruc.readBatch(slab, batchingPackets, lifetime)
 			if err != nil {
 				if neterror.PacketWasTruncated(err) {
 					continue
@@ -3571,8 +3571,9 @@ func (c *Conn) Bind() conn.Bind {
 // The subsequent Close is a real close.
 type connBind struct {
 	*Conn
-	mu     sync.Mutex
-	closed bool
+	mu              sync.Mutex
+	closed          bool
+	receiveLifetime *udpReceiveLifetime
 }
 
 // This is a compile-time assertion that connBind implements the wireguard-go
@@ -3605,11 +3606,12 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 		return nil, 0, errors.New("magicsock: connBind already open")
 	}
 	c.closed = false
+	c.receiveLifetime = new(udpReceiveLifetime)
 	var fns []conn.ReceiveFunc
 	if !hasUDPTransport {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	} else {
-		fns = []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
+		fns = []conn.ReceiveFunc{c.receiveIPv4(c.receiveLifetime), c.receiveIPv6(c.receiveLifetime), c.receiveDERP}
 	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
@@ -3634,6 +3636,9 @@ func (c *connBind) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.receiveLifetime.mu.Lock()
+	c.receiveLifetime.closed = true
+	c.receiveLifetime.mu.Unlock()
 	// Unblock all outstanding receives.
 	c.pconn4.Close()
 	c.pconn6.Close()

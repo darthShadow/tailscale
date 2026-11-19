@@ -519,7 +519,7 @@ func TestNewConn(t *testing.T) {
 	go func() {
 		slab := make([]byte, batching.ReadSlabMultiple)
 		packets := make([]wgconn.ReceivedPacket, batching.MinimumReadBatchSize)
-		receiveIPv4 := conn.receiveIPv4()
+		receiveIPv4 := conn.receiveIPv4(nil)
 		for {
 			_, err := receiveIPv4(slab, packets)
 			if err != nil {
@@ -1776,7 +1776,7 @@ func setUpReceiveFrom(tb testing.TB) (roundTrip func()) {
 	}
 	slab := make([]byte, batching.ReadSlabMultiple)
 	packets := make([]wgconn.ReceivedPacket, batching.MinimumReadBatchSize)
-	receiveIPv4 := conn.receiveIPv4()
+	receiveIPv4 := conn.receiveIPv4(nil)
 	return func() {
 		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
 			tb.Fatalf("WriteTo: %v", err)
@@ -2010,7 +2010,7 @@ func TestRebindStress(t *testing.T) {
 	go func() {
 		slab := make([]byte, batching.ReadSlabMultiple)
 		packets := make([]wgconn.ReceivedPacket, batching.MinimumReadBatchSize)
-		receiveIPv4 := conn.receiveIPv4()
+		receiveIPv4 := conn.receiveIPv4(nil)
 		for {
 			_, err := receiveIPv4(slab, packets)
 			if ctx.Err() != nil {
@@ -2445,6 +2445,188 @@ func TestRebindingUDPConn(t *testing.T) {
 	defer realConn.Close()
 	c.setConnLocked(realConn.(nettype.PacketConn), "udp4", nil)
 	c.setConnLocked(newBlockForeverConn(), "", nil)
+}
+
+// bindReceiveTestConn controls error delivery independently of socket closure.
+type bindReceiveTestConn struct {
+	*blockForeverConn
+	t        *testing.T
+	lifetime *udpReceiveLifetime
+	entered  chan struct{}
+	release  chan struct{}
+	packets  chan []byte
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func newBindReceiveTestConn(t *testing.T) *bindReceiveTestConn {
+	return &bindReceiveTestConn{
+		t:                t,
+		blockForeverConn: newBlockForeverConn(),
+		entered:          make(chan struct{}, 8), release: make(chan struct{}),
+		packets: make(chan []byte, 8), closed: make(chan struct{}),
+	}
+}
+
+func (c *bindReceiveTestConn) Close() error {
+	c.once.Do(func() {
+		if c.lifetime != nil {
+			c.lifetime.mu.Lock()
+			if !c.lifetime.closed {
+				c.t.Error("socket closed before bind receive lifetime ended")
+			}
+			c.lifetime.mu.Unlock()
+		}
+		close(c.closed)
+	})
+	return nil
+}
+
+func (c *bindReceiveTestConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
+	c.entered <- struct{}{}
+	select {
+	case p := <-c.packets:
+		return copy(b, p), netip.MustParseAddrPort("192.0.2.1:1234"), nil
+	case <-c.closed:
+		<-c.release
+		return 0, netip.AddrPort{}, net.ErrClosed
+	}
+}
+
+type bindReceiveBatchTestConn struct{ *bindReceiveTestConn }
+
+func (c *bindReceiveBatchTestConn) ReadBatch(slab []byte, packets []batching.ReceivedPacket) (int, error) {
+	n, ap, err := c.ReadFromUDPAddrPort(slab)
+	if err != nil {
+		return 0, err
+	}
+	packets[0] = batching.ReceivedPacket{Size: n, Source: ap}
+	return 1, nil
+}
+
+func (c *bindReceiveBatchTestConn) WriteBatchTo([][]byte, netip.AddrPort, packet.GeneveHeader, int) error {
+	return errors.New("unexpected batch write")
+}
+
+func TestBindReceiveLifetime(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		for _, family := range []int{0, 1} {
+			for _, schedule := range []string{"delayed-error", "late-start", "open-replacement", "reopen"} {
+				t.Run(fmt.Sprintf("batch=%t/ipv%d/%s", batch, 4+2*family, schedule), func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						c := newConn(t.Logf)
+						c.health = health.NewTracker(eventbustest.NewBus(t))
+						c.metrics = new(metrics)
+						c.havePrivateKey.Store(true)
+						c.pconn4.setConnLocked(newBlockForeverConn(), "", nil)
+						c.pconn6.setConnLocked(newBlockForeverConn(), "", nil)
+						ruc := []*RebindingUDPConn{&c.pconn4, &c.pconn6}[family]
+						var current *bindReceiveTestConn
+						install := func(pc *bindReceiveTestConn) {
+							var p nettype.PacketConn = pc
+							if batch {
+								p = &bindReceiveBatchTestConn{pc}
+							}
+							ruc.mu.Lock()
+							ruc.closeLocked()
+							ruc.setConnLocked(p, "", nil)
+							ruc.mu.Unlock()
+							current = pc
+						}
+						original, replacement := newBindReceiveTestConn(t), newBindReceiveTestConn(t)
+						defer original.Close()
+						defer replacement.Close()
+						defer close(replacement.release)
+						install(original)
+						open := func() []wgconn.ReceiveFunc {
+							fns, _, err := c.bind.Open(0)
+							if err != nil {
+								t.Fatal(err)
+							}
+							return fns
+						}
+						closeBind := func(fns []wgconn.ReceiveFunc) {
+							// Arm the ordering assertion only for bind Close; an open-bind
+							// socket replacement legitimately closes its old socket.
+							current.lifetime = c.bind.receiveLifetime
+							if err := c.bind.Close(); err != nil {
+								t.Fatal(err)
+							}
+							// Drain the real DERP sentinel before another Open/Close.
+							if _, err := fns[2](make([]byte, batching.ReadSlabMultiple), make([]wgconn.ReceivedPacket, batching.MinimumReadBatchSize)); !errors.Is(err, net.ErrClosed) {
+								t.Fatalf("DERP receive after Close = %v, want net.ErrClosed", err)
+							}
+							if len(c.derpRecvCh) != 0 {
+								t.Fatal("DERP sentinel not drained")
+							}
+						}
+						fns := open()
+						type result struct {
+							n    int
+							err  error
+							data string
+						}
+						start := func(fn wgconn.ReceiveFunc) <-chan result {
+							done := make(chan result, 1)
+							go func() {
+								slab := make([]byte, batching.ReadSlabMultiple)
+								packets := make([]wgconn.ReceivedPacket, batching.MinimumReadBatchSize)
+								n, err := fn(slab, packets)
+								done <- result{n, err, string(slab[packets[0].Offset : packets[0].Offset+packets[0].Size])}
+							}()
+							return done
+						}
+						check := func(done <-chan result, wantClosed bool) {
+							t.Helper()
+							synctest.Wait()
+							select {
+							case got := <-done:
+								if wantClosed {
+									if got.n != 0 || !errors.Is(got.err, net.ErrClosed) {
+										t.Errorf("receive = %+v, want 0, net.ErrClosed", got)
+									}
+								} else if got.n != 1 || got.err != nil || got.data != "wireguard" {
+									t.Errorf("receive = %+v, want replacement packet", got)
+								}
+							default:
+								t.Fatal("receive remains blocked after controlled replacement")
+							}
+						}
+						var done <-chan result
+						if schedule != "late-start" {
+							done = start(fns[family])
+							<-original.entered
+						}
+						if schedule != "open-replacement" {
+							closeBind(fns)
+						}
+						install(replacement)
+						for range 3 {
+							replacement.packets <- []byte("wireguard")
+						}
+						if schedule == "reopen" {
+							newFns := open()
+							check(start(newFns[family]), false)
+							close(original.release)
+							check(done, true)
+							check(start(fns[family]), true)
+							check(start(newFns[family]), false)
+							closeBind(newFns)
+						} else {
+							close(original.release)
+							if schedule == "late-start" {
+								done = start(fns[family])
+							}
+							check(done, schedule != "open-replacement")
+							if schedule == "open-replacement" {
+								closeBind(fns)
+							}
+						}
+					})
+				})
+			}
+		}
+	}
 }
 
 // https://github.com/tailscale/tailscale/issues/6680: don't ignore

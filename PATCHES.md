@@ -5,8 +5,9 @@ Module: `tailscale.com`. Base: Tailscale `v1.104.2`, commit
 The fork tag format is `<upstream-version>-patch.<n>`; the first release target
 is `v1.104.2-patch.1`.
 
-All behavior changes are opt-in. Default `magicsock.Options` and a
-`derphttp.Client` without `StreamDial` retain upstream behavior.
+Transport policy changes are opt-in. Default `magicsock.Options` and a
+`derphttp.Client` without `StreamDial` retain upstream transport policy.
+T9 fixes the bind receive shutdown contract for all callers.
 
 | Patch | Intent | Tests |
 |---|---|---|
@@ -15,6 +16,7 @@ All behavior changes are opt-in. Default `magicsock.Options` and a
 | T5 | Dial authenticated DERP streams through `Client.StreamDial` and `Options.SignalingRegions`. Own streams through handshake failure, cancellation and Close; use the connect watchdog. | `TestStreamDialEveryConnect`, `TestSignalingRegionDial` |
 | T7 | Cap CallMeMaybe endpoints only when `MaxCallMeMaybeEndpoints` is positive. Export `CapEndpoints` for the same registration selection: STUN and port-mapped addresses, IPv4, then IPv6, with stable order in each group. | `TestCallMeMaybeEndpointCap`, `TestCapEndpointsOrder` |
 | T8 | Opt in with `Options.DirectPathRecovery` to retain the best address while revalidating after new peer endpoints, local rebinds or data-active path loss. Keep one freshness boundary per recovery episode and reject stale pongs for path selection. Announce changed local endpoints to data-active peers and peers in the first 5 s of recovery; use 500 ms heartbeats only during data activity. Run `DirectPathValidatedFunc` asynchronously when a fresh direct pong restores trust. A CallMeMaybe omission clears both advertisement marks and keeps the current best address; ping timeouts still clear a dead path. | `TestDirectPathRecoveryNewEndpoint`, `TestDirectPathRecoveryAnnouncesEndpoints`, `TestDirectPathRecoveryLiveness`, `TestDirectPathRecoverySilentRemap` |
+| T9 | End each bind Open's UDP receive lifetime before Close closes sockets. Coordinate each socket snapshot and replacement retry with that lifetime; reopening leaves old receive functions closed. Preserve open-bind retries and DERP sentinel draining. | `TestBindReceiveLifetime` |
 
 T3 (ECN), T4 (UDP buffer sizing) and T6 (patch-level constants) are not part
 of this fork. Upstream's UDP buffer settings stay in place. This fork adds no
